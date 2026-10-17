@@ -21,9 +21,8 @@ pub struct Gpu {
 }
 
 const KERNELS: &[&str] = &[
-    "norm_rotate", "swiglu_rotate", "gate_rotate", "gated_norm_rotate", "embed", "qmv4", "qmv3", "qmvt2", "qmvx",
-    "qmm3", "qmmh32", "qmmh64", "qmvh1_1", "qmvh1_2", "qmvh1_4", "qmvh2_1", "qmvh2_2", "qmvh2_4",
-    "gdn_ab", "gdn_conv", "conv_state", "gdn_recurrent", "attn_prep", "attn_split", "attn_combine", "argmax1",
+    "norm_rotate", "swiglu_rotate", "gate_rotate", "gated_norm_rotate", "embed", "qmv4", "qmv3", "qmvx",
+    "qmm3", "qmvr", "gdn_ab", "gdn_conv", "conv_state", "gdn_recurrent", "attn_prep", "attn_split", "attn_combine", "argmax1",
     "argmax2", "lora_b", "v_gemm", "v_layernorm", "v_rope", "v_flash",
 ];
 

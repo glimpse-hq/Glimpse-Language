@@ -106,7 +106,7 @@ BONSAI_MODEL_DIR=/path/to/2b cargo test --release --features bonsai --test bonsa
 BONSAI_MODEL_DIR=/path/to/4b cargo test --release --features bonsai --test bonsai_golden -- --ignored
 ```
 
-If the patch no longer applies, redo its three small changes by hand and regenerate it with `diff -u`. Do not edit the copied files directly. Current copy: bonsai-ane `rust/` as of 2026-10-17 01:00.
+If the patch no longer applies, redo its three small changes by hand and regenerate it with `diff -u`. Do not edit the copied files directly. Current copy: bonsai-ane `rust/` as of 2026-10-17 02:00.
 
 The golden test compares output with PrismML's MLX runtime on the prompts in `tests/golden`, cold, from the cached prompt and without speculation.
 

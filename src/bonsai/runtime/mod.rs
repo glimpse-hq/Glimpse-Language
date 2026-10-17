@@ -77,6 +77,73 @@ fn lookup(seq: &[u32], user_len: usize, sp: &Spec, limit: usize) -> Vec<u32> {
     Vec::new()
 }
 
+/// Encodes a deferred `accept` (see `Model::defer_accept`) into `cmd`.
+fn encode_pending(pending: &mut Option<(usize, usize)>, text: &mut Text, wb: &gpu::Buffer, cmd: &mut gpu::Cmd) {
+    if let Some((t, n)) = pending.take() {
+        text.encode_accept(cmd, wb, t, n);
+    }
+}
+
+/// Verify cost in decode steps for T = 1..=8 rows (the last token plus T - 1 drafts), accept included
+/// (`bonsai --verify-bench`, M2 Pro, results/rust.md "Optimization 2"). T = 2, 3 use qmvr, T >= 4 the MMA kernel.
+const VERIFY_COST_2B: [f64; 8] = [1.0, 1.57, 2.1, 2.6, 2.6, 2.6, 2.65, 2.65];
+const VERIFY_COST_4B: [f64; 8] = [1.0, 1.6, 2.15, 2.8, 2.85, 2.9, 2.95, 3.0];
+/// Expected gain (tokens per step relative to plain decoding) needed to keep speculating, and the higher bar
+/// for switching back from plain decoding (hysteresis). The margin covers what the cost table leaves out
+/// (a host sync per round where plain decoding is pipelined, estimate noise); 1.0 lost 5% on the 4B w120 case.
+const KEEP_GAIN: f64 = 1.05;
+const ENTER_GAIN: f64 = 1.15;
+/// Backstop: after this many verify rounds, a request whose rounds returned fewer than KEEP_GAIN tokens per
+/// step of table cost decodes plainly to the end.
+const GIVE_UP_ROUNDS: usize = 6;
+
+/// Adaptive speculation policy. Drafts are accepted left to right, so with a per-draft acceptance p a round
+/// of k drafts yields E(k) = (1 - p^(k+1)) / (1 - p) tokens for cost[k] steps. Each round picks the k with
+/// the best E(k) / cost[k]; k = 0 (plain decoding, 1 token per step) when none clears the margin. p comes from
+/// accepted and rejected drafts of recent rounds (decayed per round) plus a prior from results/spec.md.
+struct Policy {
+    cost: &'static [f64; 8],
+    kmax: usize,
+    acc: f64,
+    rej: f64,
+}
+
+impl Policy {
+    /// Prior: p = 0.85 worth 4 drafts (spec.md: 80-88% of drafts accepted at k = 2..4 on cleanup prompts).
+    const PRIOR_ACC: f64 = 3.4;
+    const PRIOR_REJ: f64 = 0.6;
+    /// Per-round decay of the counts: the estimate follows the last ~7 rounds (output that stops copying the
+    /// input, like the run-on tail after a cleanup, drops it within a few rounds).
+    const DECAY: f64 = 0.85;
+
+    fn new(cost: &'static [f64; 8], kmax: usize) -> Policy {
+        Policy { cost, kmax: kmax.min(7), acc: 0.0, rej: 0.0 }
+    }
+
+    fn p(&self) -> f64 {
+        (self.acc + Self::PRIOR_ACC) / (self.acc + self.rej + Self::PRIOR_ACC + Self::PRIOR_REJ)
+    }
+
+    /// Best draft length up to `limit` and its expected tokens per step; (0, 1) if none beats `min_gain`.
+    fn choose(&self, limit: usize, min_gain: f64) -> (usize, f64) {
+        let p = self.p();
+        let mut best = (0, 1.0);
+        for k in 1..=self.kmax.min(limit) {
+            let g = (1.0 - p.powi(k as i32 + 1)) / (1.0 - p) / self.cost[k];
+            if g > best.1 && g > min_gain {
+                best = (k, g);
+            }
+        }
+        best
+    }
+
+    /// A round (real or shadow) drafted k tokens and m were accepted.
+    fn update(&mut self, k: usize, m: usize) {
+        self.acc = self.acc * Self::DECAY + m as f64;
+        self.rej = self.rej * Self::DECAY + (m < k) as u32 as f64;
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Stats {
     pub prompt_tokens: usize,
@@ -89,6 +156,8 @@ pub struct Stats {
     pub verify_calls: usize,
     pub drafted: usize,
     pub accepted: usize,
+    /// Plain-to-speculation switches of the adaptive policy.
+    pub switches: usize,
 }
 
 pub struct Model {
@@ -100,9 +169,11 @@ pub struct Model {
     vision: Option<vision::Vision>,
     prefix: Option<(Vec<u32>, State, usize, i32)>,
     dir: std::path::PathBuf,
-    /// Prompt-lookup speculation for generate() (on by default, k = 7: a verify of up to 8 rows costs the same,
-    /// output is token-identical to plain greedy); None decodes one token per step, pipelined.
+    /// Prompt-lookup speculation for generate() (on by default; draft length chosen per round by `Policy`, up
+    /// to `draft_max`; output is token-identical to plain greedy); None decodes one token per step, pipelined.
     pub spec: Option<Spec>,
+    /// Deferred accept (t, n) of the last verify.
+    pending: Option<(usize, usize)>,
     /// Benchmarks only: keep decoding past EOS.
     pub ignore_eos: bool,
 }
@@ -138,6 +209,7 @@ impl Model {
             prefix: None,
             dir: dir.to_path_buf(),
             spec: Some(Spec::default()),
+            pending: None,
             ignore_eos: false,
         })
     }
@@ -157,6 +229,7 @@ impl Model {
     /// Runs `ids` (with optional spliced embeddings) through the model; returns argmax after the last row.
     /// `rows` are host embeddings for some rows: (row index, hidden-size floats).
     pub fn prefill(&mut self, ids: &[u32], pos: &[[i32; 3]], rows: &[(usize, &[f32])]) -> u32 {
+        self.flush_accept();
         let mut next = 0;
         let mut i = 0;
         let d = self.text.cfg.hidden;
@@ -202,11 +275,12 @@ impl Model {
 
     /// One decode step: feed `id`, return the greedy next token.
     pub fn step(&mut self, id: u32) -> u32 {
+        let mut cmd = self.gpu.begin();
+        encode_pending(&mut self.pending, &mut self.text, &self.w.buf, &mut cmd);
         let p = self.text.state.pos;
         self.text.write_ids(&[id]);
         self.text.write_pos(&[[p, p, p]]);
         let wb = &self.w.buf;
-        let mut cmd = self.gpu.begin();
         self.text.encode_embed(&mut cmd, wb, 1);
         self.text.encode_layers(&mut cmd, wb, 1, false);
         self.text.encode_head(&mut cmd, wb, 0, 1);
@@ -219,13 +293,14 @@ impl Model {
     /// Feeds `ids` (last emitted token plus drafts) in one forward and returns the argmax at every row.
     /// State is left untouched until `accept`.
     pub fn verify(&mut self, ids: &[u32]) -> Vec<u32> {
+        let mut cmd = self.gpu.begin();
+        encode_pending(&mut self.pending, &mut self.text, &self.w.buf, &mut cmd);
         let t = ids.len();
         let p = self.text.state.pos;
         let pos: Vec<[i32; 3]> = (0..t as i32).map(|k| [p + k; 3]).collect();
         self.text.write_ids(ids);
         self.text.write_pos(&pos);
         let wb = &self.w.buf;
-        let mut cmd = self.gpu.begin();
         self.text.encode_embed(&mut cmd, wb, t);
         self.text.encode_layers(&mut cmd, wb, t, true);
         self.text.encode_head(&mut cmd, wb, 0, t);
@@ -235,12 +310,27 @@ impl Model {
 
     /// Commits the first `n` rows of the last `verify` call of `t` rows.
     pub fn accept(&mut self, t: usize, n: usize) {
-        let mut cmd = self.gpu.begin();
-        self.text.encode_accept(&mut cmd, &self.w.buf, t, n);
-        cmd.finish();
+        self.defer_accept(t, n);
+        self.flush_accept();
+    }
+
+    /// Like `accept`, but the commit is encoded at the start of the next `verify` or `step` command buffer,
+    /// which saves a submit and wait per speculation round. `flush_accept` runs it on its own.
+    pub fn defer_accept(&mut self, t: usize, n: usize) {
+        assert!(self.pending.is_none());
+        self.pending = Some((t, n));
+    }
+
+    pub fn flush_accept(&mut self) {
+        if self.pending.is_some() {
+            let mut cmd = self.gpu.begin();
+            encode_pending(&mut self.pending, &mut self.text, &self.w.buf, &mut cmd);
+            cmd.finish();
+        }
     }
 
     pub fn reset(&mut self) {
+        self.pending = None;
         self.text.reset();
     }
 
@@ -251,6 +341,7 @@ impl Model {
     /// Restores the cached state after `prefix` (token ids), or prefills and caches it. Returns the
     /// number of tokens served from the cache.
     pub fn start_prefix(&mut self, prefix: &[u32]) -> usize {
+        self.pending = None;
         if let Some((k, snap, len, pos)) = &self.prefix {
             if k.as_slice() == prefix {
                 let mut cmd = self.gpu.begin();
@@ -385,13 +476,11 @@ impl Model {
         if max_tokens > 0 && !EOS.contains(&next) {
             out.push(next);
             emit(&stream.push(self.tok.token_bytes(next)));
-            // `feed`: last emitted token, not yet run through the model.
-            let mut feed = Some(next);
-            if let Some(sp) = self.spec {
-                feed = self.decode_spec(sp, &raw, next, &mut out, max_tokens, &mut st, &mut stream, &mut emit);
-            }
-            if let Some(f) = feed {
-                self.decode_plain(f, &mut out, max_tokens, &mut stream, &mut emit);
+            match self.spec {
+                Some(sp) => self.decode_spec(sp, &raw, &mut out, max_tokens, &mut st, &mut stream, &mut emit),
+                None => {
+                    self.decode_plain(next, &mut out, max_tokens, &mut stream, &mut emit, |_| false);
+                }
             }
         }
         st.decode_s = td.elapsed().as_secs_f64();
@@ -399,31 +488,75 @@ impl Model {
         Ok((out, st))
     }
 
-    /// Prompt-lookup speculation. Returns the unfed last token if it gives up (acceptance under 20% after 3
-    /// rounds: output that does not copy the input), so plain pipelined decoding can continue; None when done.
+    /// Prompt-lookup speculation with the adaptive policy (`Policy`): each round drafts the k that maximizes
+    /// expected tokens per unit of verify cost, or decodes plainly (pipelined) while speculation does not pay,
+    /// scoring shadow rounds on the real output to decide when to switch back. `out` holds the first token.
     #[allow(clippy::too_many_arguments)]
     fn decode_spec(
         &mut self,
         sp: Spec,
         user: &[u32],
-        first: u32,
         out: &mut Vec<u32>,
         max_tokens: usize,
         st: &mut Stats,
         stream: &mut Utf8Stream,
         emit: &mut impl FnMut(&str),
-    ) -> Option<u32> {
+    ) {
+        let cost = if self.text.cfg.hidden <= 2048 { &VERIFY_COST_2B } else { &VERIFY_COST_4B };
+        let mut pol = Policy::new(cost, sp.draft_max);
         let mut seq = user.to_vec();
-        seq.push(first);
+        seq.extend_from_slice(out);
+        let ulen = user.len();
+        // realized tokens and table cost of the verify rounds so far
+        let (mut got, mut spent, mut rounds) = (0.0, 0.0, 0);
         while out.len() < max_tokens {
             if ext::cancelled() {
-                return None;
+                return;
             }
             let last = *seq.last().unwrap();
-            if st.verify_calls >= 3 && st.accepted * 5 < st.drafted {
-                return Some(last);
+            let left = max_tokens - out.len();
+            if rounds >= GIVE_UP_ROUNDS && got < KEEP_GAIN * spent {
+                // Acceptance comes in bursts the estimate keeps chasing: plain for the rest of the request.
+                self.decode_plain(last, out, max_tokens, stream, emit, |_| false);
+                return;
             }
-            let draft = lookup(&seq, user.len(), &sp, max_tokens - out.len());
+            let k = pol.choose(left - 1, KEEP_GAIN).0;
+            if k == 0 {
+                // Plain decoding; shadow rounds (what lookup would have drafted vs what came out) update the
+                // estimate, and speculation resumes once it clears the entry margin.
+                let (mut next_start, mut sh_pos, mut sh): (usize, usize, Vec<u32>) = (seq.len(), 0, Vec::new());
+                let stop = |id: u32| {
+                    seq.push(id);
+                    let j = seq.len() - 1;
+                    if !sh.is_empty() && j >= sh_pos {
+                        let i = j - sh_pos;
+                        if seq[j] != sh[i] {
+                            pol.update(sh.len(), i);
+                            sh.clear();
+                            next_start = j + 1;
+                        } else if i + 1 == sh.len() {
+                            pol.update(sh.len(), sh.len());
+                            sh.clear();
+                            next_start = j + 2;
+                        }
+                    }
+                    if sh.is_empty() && seq.len() >= next_start {
+                        sh = lookup(&seq, ulen, &sp, usize::MAX);
+                        sh_pos = seq.len();
+                        next_start = seq.len() + 1;
+                    }
+                    pol.choose(sp.draft_max, ENTER_GAIN).0 > 0
+                };
+                match self.decode_plain(last, out, max_tokens, stream, emit, stop) {
+                    Some(id) => {
+                        seq.push(id);
+                        st.switches += 1;
+                        continue;
+                    }
+                    None => return,
+                }
+            }
+            let draft = lookup(&seq, ulen, &Spec { draft_max: k, ..sp }, left - 1);
             let new = if draft.is_empty() {
                 vec![self.step(last)]
             } else {
@@ -431,7 +564,11 @@ impl Model {
                 ids.extend_from_slice(&draft);
                 let pred = self.verify(&ids);
                 let m = draft.iter().zip(&pred).take_while(|(d, p)| d == p).count();
-                self.accept(ids.len(), m + 1);
+                self.defer_accept(ids.len(), m + 1);
+                pol.update(draft.len(), m);
+                got += (m + 1) as f64;
+                spent += cost[draft.len()];
+                rounds += 1;
                 st.verify_calls += 1;
                 st.drafted += draft.len();
                 st.accepted += m;
@@ -441,18 +578,19 @@ impl Model {
             };
             for id in new {
                 if (EOS.contains(&id) && !self.ignore_eos) || out.len() >= max_tokens {
-                    return None;
+                    return;
                 }
                 out.push(id);
                 seq.push(id);
                 emit(&stream.push(self.tok.token_bytes(id)));
             }
         }
-        None
     }
 
     /// Plain greedy decoding with two steps in flight: step k reads its token from GPU ring slot k % 2 and
-    /// writes the next to (k + 1) % 2, so there is no host round trip per token.
+    /// writes the next to (k + 1) % 2, so there is no host round trip per token. `stop(id)` is called for every
+    /// emitted token; when it returns true the step in flight is drained and its token (emitted, not yet fed)
+    /// is returned. None: EOS or the token cap.
     fn decode_plain(
         &mut self,
         feed: u32,
@@ -460,10 +598,12 @@ impl Model {
         max_tokens: usize,
         stream: &mut Utf8Stream,
         emit: &mut impl FnMut(&str),
-    ) {
+        mut stop: impl FnMut(u32) -> bool,
+    ) -> Option<u32> {
         if out.len() >= max_tokens {
-            return;
+            return None;
         }
+        self.flush_accept();
         self.text.set_ring(0, feed);
         let mut k = 0;
         let mut cmd = self.gpu.begin();
@@ -492,11 +632,20 @@ impl Model {
             }
             out.push(id);
             emit(&stream.push(self.tok.token_bytes(id)));
-            match cur {
-                Some(c) => prev = c,
-                None => break,
+            let Some(c) = cur else { break };
+            if stop(id) {
+                c.wait();
+                let id = self.text.ring(k + 1);
+                if (EOS.contains(&id) && !self.ignore_eos) || out.len() >= max_tokens {
+                    return None;
+                }
+                out.push(id);
+                emit(&stream.push(self.tok.token_bytes(id)));
+                return Some(id);
             }
+            prev = c;
         }
+        None
     }
 
     pub fn dir(&self) -> &Path {

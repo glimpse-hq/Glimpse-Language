@@ -176,6 +176,7 @@ impl Idle {
             dir: self.dir,
             spec: self.spec,
             ignore_eos: false,
+            pending: None,
         }
     }
 }

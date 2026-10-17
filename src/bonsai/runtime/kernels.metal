@@ -252,62 +252,16 @@ kernel void qmv4(device const uint* W [[buffer(0)]], device const half* S [[buff
     qmv_rows<4>(W, S, x, y, K, (tg * 2 + sid) * 4, add, lane, B, u, lr);
 }
 
-// T-row matvec for verify (T <= NT): qmv4's loop with each row's codes decoded once and applied to every token.
-// 2 simdgroups x 4 rows per threadgroup.
-template <int NT>
-[[kernel]] void qmvt_t(device const uint* W [[buffer(0)]], device const half* S [[buffer(1)]],
-                       device const float* X [[buffer(2)]], device float* Y [[buffer(3)]],
-                       constant uint& K [[buffer(4)]], constant uint& O [[buffer(5)]], constant uint& add [[buffer(6)]],
-                       constant uint& T [[buffer(7)]], uint tg [[threadgroup_position_in_grid]],
-                       uint sid [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-    uint row0 = (tg * 2 + sid) * 4;
-    uint kw = K / 16, kg = K / 128;
-    float acc[NT][4];
-    for (int t = 0; t < NT; t++) for (int r = 0; r < 4; r++) acc[t][r] = 0;
-    for (uint k0 = lane * 16; k0 < K; k0 += 512) {
-        float2 xv[NT][8];
-        float xs[NT];
-        for (int t = 0; t < NT; t++) {
-            device const float* xp = X + min(uint(t), T - 1) * K + k0;
-            float4 a0 = *(device const float4*)xp, a1 = *(device const float4*)(xp + 4);
-            float4 b0 = *(device const float4*)(xp + 8), b1 = *(device const float4*)(xp + 12);
-            float lo[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
-            float hi[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
-            xs[t] = 0;
-            for (uint j = 0; j < 8; j++) {
-                float sc = j < 5 ? exp2(-2.0f * float(j)) : exp2(-2.0f * float(j - 5));
-                xs[t] += lo[j] + hi[j];
-                xv[t][j] = float2(lo[j], hi[j]) * sc;
-            }
-        }
-        for (int r = 0; r < 4; r++) {
-            uint wd = W[(row0 + r) * kw + k0 / 16];
-            uint lo2 = wd, hi2 = wd >> 10;
-            float2 f[8];
-            for (uint j = 0; j < 8; j++) {
-                uint m = j < 5 ? (lo2 & (0x00030003u << (2 * j))) : (hi2 & (0x00030003u << (2 * (j - 5))));
-                f[j] = float2(as_type<half2>(m | 0x64006400u) - half2(1024.0h));
-            }
-            float sc = float(S[(row0 + r) * kg + k0 / 128]);
-            for (int t = 0; t < NT; t++) {
-                float d = 0;
-                for (uint j = 0; j < 8; j++) d += xv[t][j].x * f[j].x + xv[t][j].y * f[j].y;
-                acc[t][r] += sc * (d - xs[t]);
-            }
-        }
-    }
-    for (int t = 0; t < NT; t++) {
-        for (int r = 0; r < 4; r++) {
-            float v = simd_sum(acc[t][r]);
-            if (lane == 0 && uint(t) < T) {
-                uint o = t * O + row0 + r;
-                Y[o] = add ? Y[o] + v : v;
-            }
-        }
-    }
+// Small-T matvec: qmv4 with one simdgroup pair per token in the same threadgroup, so the T copies read the same
+// weights at the same time (one DRAM read, the rest hit the cache). Threadgroup 2 T simdgroups, 8 rows.
+kernel void qmvr(device const uint* W [[buffer(0)]], device const half* S [[buffer(1)]],
+                 device const float* X [[buffer(2)]], device float* Y [[buffer(3)]],
+                 constant uint& K [[buffer(4)]], constant uint& O [[buffer(5)]], constant uint& add [[buffer(6)]],
+                 constant uint& T [[buffer(7)]], uint tg [[threadgroup_position_in_grid]],
+                 uint sid [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    uint t = sid / 2;
+    qmv_rows<4>(W, S, X + t * K, Y + t * O, K, (tg * 2 + sid % 2) * 4, add, lane, S, X, 0u);
 }
-template [[host_name("qmvt2")]] [[kernel]] void qmvt_t<2>(device const uint*, device const half*, device const float*,
-    device float*, constant uint&, constant uint&, constant uint&, constant uint&, uint, uint, uint);
 
 // Up to three matvecs sharing one input in a single dispatch (rows of matrix i follow matrix i-1).
 // Same inner loop as qmv4: 2 simdgroups x 4 rows per threadgroup, 16 codes per lane per step.
@@ -562,153 +516,6 @@ kernel void qmvx(device const uint* W [[buffer(0)]], device const half* S [[buff
         }
     }
 }
-
-// Prefill matmul, fp16 operands with fp32 accumulation: Y[T, O] (+)= X[T, K] W[O, K]^T. Tile BT tokens x 64 rows,
-// K step 32, 4 simdgroups each 32 tokens x (64 / SO) rows (SO = 4 / (BT / 32)). X is rounded to half on load.
-// Threadgroup tiles hold 8x8 blocks contiguously (X block [t][k], W block [k][o]) so every simdgroup_load reads
-// 64 consecutive halves. Global loads for the next K step are issued before the MMAs of the current one.
-template <int BT>
-[[kernel]] void qmmh_t(device const uint* W [[buffer(0)]], device const half* S [[buffer(1)]],
-                       device const float* X [[buffer(2)]], device float* Y [[buffer(3)]],
-                       constant uint& K [[buffer(4)]], constant uint& O [[buffer(5)]], constant uint& add [[buffer(6)]],
-                       constant uint& T [[buffer(7)]], uint2 tg [[threadgroup_position_in_grid]],
-                       uint tid [[thread_index_in_threadgroup]], uint sid [[simdgroup_index_in_threadgroup]],
-                       uint lane [[thread_index_in_simdgroup]]) {
-    constexpr int ST = BT / 32, SO = 4 / ST, NB = 8 / SO;  // simdgroup grid, row blocks per simdgroup
-    constexpr int XF = BT / 4;                             // X floats per thread per K step
-    threadgroup half xs[BT * 32];
-    threadgroup half ws[64 * 32];
-    uint n0 = tg.x * 64, t0 = tg.y * BT;
-    uint kw = K / 16, kg = K / 128;
-    // X load: token xt, k offset xk (XF consecutive k)
-    uint xt = tid / (32 / XF), xk = (tid % (32 / XF)) * XF;
-    bool xin = t0 + xt < T;
-    device const float* xp = X + min(t0 + xt, T - 1) * K + xk;
-    // W decode: row pair (2 rp, 2 rp + 1), k block wk (8 codes)
-    uint rp = tid % 32, wk = tid / 32;
-    device const uint* w0 = W + (n0 + 2 * rp) * kw + wk / 2;
-    device const half* s0 = S + (n0 + 2 * rp) * kg;
-    uint sh0 = (wk % 2) * 16;
-    float4 xr[XF / 4];
-    uint wa, wb;
-    half2 sc;
-#define QMMH_LOAD(k0) \
-    for (int i = 0; i < XF / 4; i++) xr[i] = xin ? *(device const float4*)(xp + (k0) + 4 * i) : float4(0); \
-    wa = w0[(k0) / 16]; \
-    wb = w0[kw + (k0) / 16]; \
-    sc = half2(s0[(k0) / 128], s0[kg + (k0) / 128]);
-    uint sto = sid / SO, soo = sid % SO;  // this simdgroup's token half and row slice
-    simdgroup_float8x8 c[4][NB];
-    for (int i = 0; i < 4; i++) for (int j = 0; j < NB; j++) c[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    QMMH_LOAD(0)
-    for (uint k0 = 0; k0 < K; k0 += 32) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int i = 0; i < XF / 4; i++) {
-            uint k = xk + 4 * i;
-            *(threadgroup half4*)(xs + ((xt / 8) * 4 + k / 8) * 64 + (xt % 8) * 8 + k % 8) = half4(xr[i]);
-        }
-        threadgroup half* wp = ws + ((2 * rp / 8) * 4 + wk) * 64 + (2 * rp) % 8;
-        for (uint j = 0; j < 8; j++) {
-            uint s = sh0 + 2 * j;
-            uint m = ((wa >> s) & 3u) | (((wb >> s) & 3u) << 16);
-            *(threadgroup half2*)(wp + j * 8) = (as_type<half2>(m | 0x64006400u) - half2(1025.0h)) * sc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (k0 + 32 < K) { QMMH_LOAD(k0 + 32) }
-        for (uint kb = 0; kb < 4; kb++) {
-            simdgroup_half8x8 a[4], b[NB];
-            for (int i = 0; i < 4; i++) simdgroup_load(a[i], xs + ((sto * 4 + i) * 4 + kb) * 64, 8);
-            for (int j = 0; j < NB; j++) simdgroup_load(b[j], ws + ((soo * NB + j) * 4 + kb) * 64, 8);
-            for (int i = 0; i < 4; i++) for (int j = 0; j < NB; j++) simdgroup_multiply_accumulate(c[i][j], a[i], b[j], c[i][j]);
-        }
-    }
-    uint qid = lane / 4;
-    uint fm = (qid & 4) + ((lane / 2) % 4), fn = (qid & 2) * 2 + (lane % 2) * 2;
-    for (int i = 0; i < 4; i++) {
-        uint t = t0 + (sto * 4 + i) * 8 + fm;
-        if (t >= T) continue;
-        for (int j = 0; j < NB; j++) {
-            device float2* yp = (device float2*)(Y + t * O + n0 + (soo * NB + j) * 8 + fn);
-            float2 v = float2(c[i][j].thread_elements()[0], c[i][j].thread_elements()[1]);
-            *yp = add ? *yp + v : v;
-        }
-    }
-}
-template [[host_name("qmmh32")]] [[kernel]] void qmmh_t<32>(device const uint*, device const half*, device const float*,
-    device float*, constant uint&, constant uint&, constant uint&, constant uint&, uint2, uint, uint, uint);
-template [[host_name("qmmh64")]] [[kernel]] void qmmh_t<64>(device const uint*, device const half*, device const float*,
-    device float*, constant uint&, constant uint&, constant uint&, constant uint&, uint2, uint, uint, uint);
-
-// Small-T matmul (verify, T <= 8 NA) on fp16 MMA: X rows as NA A fragments (rounded to half), the weight fragment
-// decoded in registers as B and applied to all of them, so each weight is read once for all T rows. Lane owns
-// B (k = fm, rows fn, fn + 1). Threadgroup = 4 simdgroups: 4 / NKS row groups of 8 rows, NKS simdgroups splitting
-// K per group, partials summed in threadgroup memory. K step 64.
-template <int NA, int NKS>
-[[kernel]] void qmvh_t(device const uint* W [[buffer(0)]], device const half* S [[buffer(1)]],
-                       device const float* X [[buffer(2)]], device float* Y [[buffer(3)]],
-                       constant uint& K [[buffer(4)]], constant uint& O [[buffer(5)]], constant uint& add [[buffer(6)]],
-                       constant uint& T [[buffer(7)]], uint tg [[threadgroup_position_in_grid]],
-                       uint sid [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float red[NKS > 1 ? (4 / NKS) * (NKS - 1) * NA * 64 : 1];
-    uint rg = sid / NKS, ks = sid % NKS;
-    uint n0 = (tg * (4 / NKS) + rg) * 8;
-    uint qid = lane / 4;
-    uint fm = (qid & 4) + ((lane / 2) % 4);
-    uint fn = (qid & 2) * 2 + (lane % 2) * 2;
-    uint kw = K / 16, kg = K / 128;
-    device const uint* w0 = W + (n0 + fn) * kw;
-    device const uint* w1 = w0 + kw;
-    device const half* sp = S + (n0 + fn) * kg;
-    simdgroup_float8x8 c[NA];
-    for (int a = 0; a < NA; a++) c[a] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    for (uint k0 = ks * 64; k0 < K; k0 += 64 * NKS) {
-        uint4 a4 = *(device const uint4*)(w0 + k0 / 16);
-        uint4 b4 = *(device const uint4*)(w1 + k0 / 16);
-        half2 sc = half2(sp[k0 / 128], sp[kg + k0 / 128]);
-        for (uint f = 0; f < 8; f++) {
-            uint i = 8 * f + fm;
-            uint sh = 2 * (i & 15);
-            uint m = ((a4[i / 16] >> sh) & 3u) | (((b4[i / 16] >> sh) & 3u) << 16);
-            half2 h = (as_type<half2>(m | 0x64006400u) - half2(1025.0h)) * sc;
-            simdgroup_half8x8 b;
-            b.thread_elements()[0] = h.x;
-            b.thread_elements()[1] = h.y;
-            for (int a = 0; a < NA; a++) {
-                simdgroup_float8x8 xf;
-                simdgroup_load(xf, X + a * 8 * K + k0 + 8 * f, K);
-                simdgroup_half8x8 xh;
-                xh.thread_elements()[0] = half(xf.thread_elements()[0]);
-                xh.thread_elements()[1] = half(xf.thread_elements()[1]);
-                simdgroup_multiply_accumulate(c[a], xh, b, c[a]);
-            }
-        }
-    }
-    if (NKS > 1) {
-        threadgroup float* r = red + (rg * (NKS - 1) * NA) * 64;
-        if (ks > 0) for (int a = 0; a < NA; a++) simdgroup_store(c[a], r + ((ks - 1) * NA + a) * 64, 8);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (ks > 0) return;
-        for (uint s = 1; s < NKS; s++) {
-            for (int a = 0; a < NA; a++) {
-                simdgroup_float8x8 p;
-                simdgroup_load(p, r + ((s - 1) * NA + a) * 64, 8);
-                c[a].thread_elements()[0] += p.thread_elements()[0];
-                c[a].thread_elements()[1] += p.thread_elements()[1];
-            }
-        }
-    }
-    for (int a = 0; a < NA; a++) {
-        uint t = a * 8 + fm;
-        if (t >= T) continue;
-        device float2* yp = (device float2*)(Y + t * O + n0 + fn);
-        float2 v = float2(c[a].thread_elements()[0], c[a].thread_elements()[1]);
-        *yp = add ? *yp + v : v;
-    }
-}
-#define QMVH(NA, NKS) template [[host_name("qmvh" #NA "_" #NKS)]] [[kernel]] void qmvh_t<NA, NKS>(device const uint*, \
-    device const half*, device const float*, device float*, constant uint&, constant uint&, constant uint&, \
-    constant uint&, uint, uint, uint);
-QMVH(1, 1) QMVH(1, 2) QMVH(1, 4) QMVH(2, 1) QMVH(2, 2) QMVH(2, 4)
 
 // Split-K causal attention. Threadgroup = (kv head, key chunk, query t); the 4 q heads of that kv head share
 // each K/V read. Writes per-chunk partials (max, sum, acc[256]) to part[(t * H + h) * nsplit + s]. 256 threads.

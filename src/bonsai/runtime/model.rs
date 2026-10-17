@@ -512,46 +512,27 @@ impl Text {
             (add as u32).into(),
             (t as u32).into(),
         ];
-        let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        if env("BONSAI_OLDMM", 0) == 1 {
-            if t == 2 {
-                cmd.run("qmvt2", &args, (l.o / 8, 1, 1), (64, 1, 1));
-            } else if t <= 16 {
-                for c in (0..t).step_by(8) {
-                    let n = (t - c).min(8);
-                    let a: [Arg; 8] = [
-                        B(wb, l.w).into(),
-                        B(wb, l.s).into(),
-                        B(x.0, x.1 + c * l.k * 4).into(),
-                        B(y.0, y.1 + c * l.o * 4).into(),
-                        (l.k as u32).into(),
-                        (l.o as u32).into(),
-                        (add as u32).into(),
-                        (n as u32).into(),
-                    ];
-                    cmd.run("qmvx", &a, (l.o / 32, 1, 1), (128, 1, 1));
-                }
-            } else {
-                cmd.run("qmm3", &args, (l.o / 64, t.div_ceil(32), 1), (128, 1, 1));
+        if t <= 3 {
+            // qmv4's math per row (same results as a decode step); the T copies share each weight read
+            cmd.run("qmvr", &args, (l.o / 8, 1, 1), (64 * t, 1, 1));
+        } else if t <= 16 {
+            // verify batches: MMA with X as the A operand, 8 rows per pass
+            for c in (0..t).step_by(8) {
+                let n = (t - c).min(8);
+                let a: [Arg; 8] = [
+                    B(wb, l.w).into(),
+                    B(wb, l.s).into(),
+                    B(x.0, x.1 + c * l.k * 4).into(),
+                    B(y.0, y.1 + c * l.o * 4).into(),
+                    (l.k as u32).into(),
+                    (l.o as u32).into(),
+                    (add as u32).into(),
+                    (n as u32).into(),
+                ];
+                cmd.run("qmvx", &a, (l.o / 32, 1, 1), (128, 1, 1));
             }
-            return;
-        }
-        if t <= 16 {
-            let nks = env("BONSAI_NKS", 2);
-            let name = match (t > 8, nks) {
-                (false, 1) => "qmvh1_1",
-                (false, 2) => "qmvh1_2",
-                (false, _) => "qmvh1_4",
-                (true, 1) => "qmvh2_1",
-                (true, 2) => "qmvh2_2",
-                (true, _) => "qmvh2_4",
-            };
-            let nks = nks.min(4);
-            cmd.run(name, &args, (l.o / (32 / nks), 1, 1), (128, 1, 1));
         } else {
-            let bt = env("BONSAI_BT", 64);
-            let name = if bt == 32 { "qmmh32" } else { "qmmh64" };
-            cmd.run(name, &args, (l.o / 64, t.div_ceil(bt), 1), (128, 1, 1));
+            cmd.run("qmm3", &args, (l.o / 64, t.div_ceil(32), 1), (128, 1, 1));
         }
     }
 
@@ -1037,8 +1018,20 @@ impl Text {
         rows_per_tg: usize,
         threads: usize,
     ) {
+        let (qkv, z, out) = match &self.layers[0].mixer {
+            Mixer::Gdn { qkv, z, out, .. } => (*qkv, *z, *out),
+            _ => unreachable!(),
+        };
+        let q = match &self.layers[3].mixer {
+            Mixer::Attn { q, .. } => *q,
+            _ => unreachable!(),
+        };
         for (name, l) in [
             ("head", self.embed),
+            ("qkv", qkv),
+            ("z", z),
+            ("out", out),
+            ("q", q),
             ("gate", self.layers[0].gate),
             ("down", self.layers[0].down),
             (
@@ -1049,12 +1042,16 @@ impl Text {
                 },
             ),
         ] {
+            if name == "head" && std::env::var_os("BONSAI_KGY").is_some() {
+                continue;
+            }
             let bytes = l.o * l.k / 4 + l.o * l.k / 128 * 2;
             let reps = (2_000_000_000 / bytes).clamp(5, 2000);
             let run = |n: usize| {
                 let mut cmd = gpu.begin();
                 for _ in 0..n {
-                    let args: [Arg; 10] = [
+                    let kt: u32 = std::env::var("BONSAI_KT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let mut args: Vec<Arg> = vec![
                         B(wb, l.w).into(),
                         B(wb, l.s).into(),
                         B(&self.s.xr, 0).into(),
@@ -1062,11 +1059,14 @@ impl Text {
                         (l.k as u32).into(),
                         (l.o as u32).into(),
                         0u32.into(),
-                        B(&self.s.xr, 0).into(),
-                        B(&self.s.xr, 0).into(),
-                        0u32.into(),
                     ];
-                    cmd.run(kernel, &args, (l.o / rows_per_tg, 1, 1), (threads, 1, 1));
+                    if kt > 0 {
+                        args.push(kt.into());
+                    } else {
+                        args.extend([B(&self.s.xr, 0).into(), B(&self.s.xr, 0).into(), 0u32.into()]);
+                    }
+                    let gy: usize = std::env::var("BONSAI_KGY").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+                    cmd.run(kernel, &args, (l.o / rows_per_tg, gy, 1), (threads, 1, 1));
                 }
                 let t = std::time::Instant::now();
                 cmd.finish();
