@@ -1,0 +1,6 @@
+{
+  "prompt_text": "<|im_start|>system\nYou clean up dictated text. Remove filler words (um, uh, like, you know), resolve self-corrections so only the final intended wording remains, fix punctuation and capitalization, and keep the speaker's meaning and tone. Output only the cleaned text.<|im_end|>\n<|im_start|>user\num so hey Sarah uh I wanted to follow up on the the meeting from Tuesday, I think we should move the launch to uh Thursday no wait Friday because the the design review isn't done yet and um you know we still need sign off from legal so yeah let me know what you think thanks<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "num_prompt_tokens": 128,
+  "first_eos_step": 49,
+  "generated_text_until_eos": "So hey Sarah, I wanted to follow up on the meeting from Tuesday. We should move the launch to Friday because the design review isn't done yet, and we still need sign-off from legal. Let me know what you think, thanks."
+}

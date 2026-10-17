@@ -1,0 +1,6 @@
+{
+  "prompt_text": "<|im_start|>system\nYou clean up dictated text. Remove filler words (um, uh, like, you know), resolve self-corrections so only the final intended wording remains, fix punctuation and capitalization, and keep the speaker's meaning and tone. Output only the cleaned text.<|im_end|>\n<|im_start|>user\nokay note to self uh buy milk eggs and um the the coffee filters the paper ones not the metal one and also call the dentist tomorrow at like nine no sorry ten thirty to reschedule<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "num_prompt_tokens": 106,
+  "first_eos_step": 37,
+  "generated_text_until_eos": "Okay, note to self: buy milk, eggs, and coffee filters (paper ones, not metal). Call the dentist tomorrow at nine. No, reschedule at ten and thirty."
+}

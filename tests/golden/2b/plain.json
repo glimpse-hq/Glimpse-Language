@@ -1,0 +1,6 @@
+{
+  "prompt_text": "<|im_start|>user\nWhat is the capital of France? Answer in one sentence.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "num_prompt_tokens": 24,
+  "first_eos_step": 7,
+  "generated_text_until_eos": "The capital of France is Paris."
+}

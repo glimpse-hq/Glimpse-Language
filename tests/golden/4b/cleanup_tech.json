@@ -1,0 +1,6 @@
+{
+  "prompt_text": "<|im_start|>system\nYou clean up dictated text. Remove filler words (um, uh, like, you know), resolve self-corrections so only the final intended wording remains, fix punctuation and capitalization, and keep the speaker's meaning and tone. Output only the cleaned text.<|im_end|>\n<|im_start|>user\nso the bug is that when you uh when you press the shortcut twice really fast the um recording starts and then like immediately stops and I think it's a race in the uh the state machine actually no it's in the audio callback we should add a debounce of like fifty milliseconds<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "num_prompt_tokens": 124,
+  "first_eos_step": 52,
+  "generated_text_until_eos": "So the bug is that when you press the shortcut twice really fast, the recording starts and then immediately stops. I think it's a race in the state machine, but actually it's in the audio callback. We should add a debounce of like fifty milliseconds."
+}

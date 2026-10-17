@@ -1,0 +1,31 @@
+--- a/src/bonsai/runtime/mod.rs	2026-10-17 00:56:13
++++ b/src/bonsai/runtime/mod.rs	2026-10-17 01:05:03
+@@ -8,6 +8,7 @@
+ pub mod tokenizer;
+ pub mod vision;
+ pub mod weights;
++pub(crate) mod ext;
+ 
+ use gpu::Gpu;
+ use model::{State, Text, TMAX};
+@@ -415,6 +416,9 @@
+         let mut seq = user.to_vec();
+         seq.push(first);
+         while out.len() < max_tokens {
++            if ext::cancelled() {
++                return None;
++            }
+             let last = *seq.last().unwrap();
+             if st.verify_calls >= 3 && st.accepted * 5 < st.drafted {
+                 return Some(last);
+@@ -466,6 +470,10 @@
+         self.text.encode_step(&mut cmd, &self.w.buf, k);
+         let mut prev = cmd.commit();
+         while out.len() < max_tokens {
++            if ext::cancelled() {
++                prev.wait();
++                break;
++            }
+             k += 1;
+             let cur = if out.len() + 1 < max_tokens {
+                 let mut cmd = self.gpu.begin();
