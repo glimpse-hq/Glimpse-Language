@@ -97,16 +97,16 @@ The runtime writes a parsed tokenizer cache, `tokenizer.bonsai` (6.8 MB), next t
 
 ## Bonsai runtime sync
 
-The Metal runtime is developed in bonsai-ane (`rust/`). `src/bonsai/runtime/` holds a copy with `crate::` paths rewritten to `super::`, plus `ext.rs` (ours: template, idle release, cancel, context checks) and `scripts/bonsai-runtime.patch` (adds `mod ext` and the cancel checks in the decode loops). To pull runtime changes:
+The Metal runtime is developed in Glimpse-Lab (`g1/rust/`). `src/bonsai/runtime/` holds a copy with `crate::` paths rewritten to `super::`, plus `ext.rs` (ours: template, idle release, cancel, context checks) and `scripts/bonsai-runtime.patch` (adds `mod ext` and the cancel checks in the decode loops). To pull runtime changes:
 
 ```bash
-scripts/sync-bonsai.sh ../bonsai-ane/rust
+scripts/sync-bonsai.sh ../Glimpse-Lab/g1/rust
 cargo test --features bonsai
 BONSAI_MODEL_DIR=/path/to/2b cargo test --release --features bonsai --test bonsai_golden -- --ignored
 BONSAI_MODEL_DIR=/path/to/4b cargo test --release --features bonsai --test bonsai_golden -- --ignored
 ```
 
-If the patch no longer applies, redo its three small changes by hand and regenerate it with `diff -u`. Do not edit the copied files directly. Current copy: bonsai-ane `rust/` as of 2026-10-17 02:00.
+If the patch no longer applies, redo its three small changes by hand and regenerate it with `diff -u`. Do not edit the copied files directly. Current copy: Glimpse-Lab `g1/rust/` as of 2026-10-18.
 
 The golden test compares output with PrismML's MLX runtime on the prompts in `tests/golden`, cold, from the cached prompt and without speculation.
 
