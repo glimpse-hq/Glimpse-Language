@@ -36,8 +36,8 @@ pub const QWEN35: Template = Template {
     image: "<|vision_start|><|image_pad|><|vision_end|>",
 };
 
-/// Prompt-lookup speculation: draft the tokens that followed the latest earlier occurrence of the last
-/// n-gram (n from `ngram_max` down to `ngram_min`) in the request's prompt plus output.
+/// Prompt-lookup speculation: draft the source tokens that followed an occurrence of the output's last n words
+/// (n from `ngram_max` down to `ngram_min`); see `lookup` and `Model::draft_source`.
 #[derive(Debug, Clone, Copy)]
 pub struct Spec {
     pub ngram_max: usize,
@@ -55,27 +55,91 @@ impl Default for Spec {
     }
 }
 
-/// First earlier occurrence of the last n tokens of `seq` (n = ngram_max down to ngram_min) inside
-/// `seq[..user_len]` (the request's user turn; the cached system prompt is never searched), per results/spec.md.
-fn lookup(seq: &[u32], user_len: usize, sp: &Spec, limit: usize) -> Vec<u32> {
+/// Draft source: the request's source tokens plus a matching key per word token (lowercase, without the
+/// leading space, so "Sam" after a cleanup still finds "sam"; punctuation-only tokens get no key and are
+/// skipped when matching, so an inserted comma does not break the match).
+struct Source {
+    ids: Vec<u32>,
+    /// (key, index into ids) of the word tokens
+    words: Vec<(u64, usize)>,
+}
+
+/// Matching key of a token: bit 0 set for word tokens (the only ones matched), bit 1 set when the token
+/// contains a line break.
+fn token_key(bytes: &[u8]) -> u64 {
+    let nl = if bytes.contains(&b'\n') { 2 } else { 0 };
+    let b = bytes.strip_prefix(b" ").unwrap_or(bytes);
+    if b.iter().all(|c| c.is_ascii_punctuation() || c.is_ascii_whitespace()) {
+        return nl;
+    }
+    let h = b.iter().fold(0xcbf29ce484222325u64, |h, c| (h ^ c.to_ascii_lowercase() as u64).wrapping_mul(0x100000001b3));
+    (h & !3) | 1 | nl
+}
+
+/// Drafts for the output so far (`seq`, which ends with the output): the source tokens that followed an
+/// occurrence of the last n word keys of `seq` (n = ngram_max down to ngram_min). Takes the first occurrence
+/// that ends at or after `cursor` (where the previous draft's accepted part ended), else the first one.
+/// Returns the draft and the source position it starts at.
+fn lookup(src: &Source, seq: &[u32], keys: &[u64], sp: &Spec, limit: usize, cursor: usize) -> (Vec<u32>, usize) {
     let k = sp.draft_max.min(limit).min(model::VMAX - 1);
-    for n in (sp.ngram_min..=sp.ngram_max).rev() {
-        if seq.len() <= n {
-            continue;
+    if k == 0 {
+        return (Vec::new(), cursor);
+    }
+    let mut pat = Vec::with_capacity(sp.ngram_max);
+    for &id in seq.iter().rev().take(4 * sp.ngram_max) {
+        if pat.len() == sp.ngram_max {
+            break;
         }
-        let pat = &seq[seq.len() - n..];
-        let last = user_len.min(seq.len() - n);
-        for i in 0..last.saturating_sub(n - 1) {
-            if &seq[i..i + n] == pat {
-                let end = (i + n + k).min(user_len);
-                if end > i + n {
-                    return seq[i + n..end].to_vec();
+        let key = keys.get(id as usize).copied().unwrap_or(0);
+        if key & 1 != 0 {
+            pat.push(key);
+        }
+    }
+    pat.reverse();
+    let w = &src.words;
+    for n in (sp.ngram_min..=sp.ngram_max.min(pat.len())).rev() {
+        let p = &pat[pat.len() - n..];
+        let mut hit = None;
+        for i in 0..w.len().saturating_sub(n - 1) {
+            if w[i..i + n].iter().zip(p).all(|(a, b)| a.0 == *b) {
+                let j = w[i + n - 1].1 + 1;
+                // the output moves forward through the source: a match far behind it is a different spot
+                if j < src.ids.len() && j + BACK >= cursor && (hit.is_none() || j >= cursor) {
+                    hit = Some(j);
+                }
+                if j >= cursor {
+                    break;
                 }
             }
         }
+        if let Some(j) = hit {
+            return (src.ids[j..(j + k).min(src.ids.len())].to_vec(), j);
+        }
     }
-    Vec::new()
+    (Vec::new(), cursor)
 }
+
+/// How far behind the cursor a lookup match may start (self-corrections repeat a few words).
+const BACK: usize = 24;
+
+/// Delimiters of the text a request asks to rewrite (Glimpse's cleanup and Edit Mode turns). Drafts come from
+/// inside the first block found, so instructions around it are never drafted; without one, the whole user turn.
+const SOURCE_TAGS: [(&str, &str); 2] = [("<transcript>\n", "\n</transcript>"), ("<text>\n", "\n</text>")];
+/// Words a cleanup capitalizes anywhere (drafts get them capitalized).
+const CAPITALIZED: [&[u8]; 18] = [
+    b"monday", b"tuesday", b"wednesday", b"thursday", b"friday", b"saturday", b"sunday", b"january", b"february",
+    b"march", b"april", b"june", b"july", b"august", b"september", b"october", b"november", b"december",
+];
+/// Contractions a transcript may spell without the apostrophe.
+const CONTRACTIONS: [(&str, &str); 22] = [
+    ("dont", "don't"), ("doesnt", "doesn't"), ("didnt", "didn't"), ("isnt", "isn't"), ("wasnt", "wasn't"),
+    ("arent", "aren't"), ("werent", "weren't"), ("wont", "won't"), ("cant", "can't"), ("couldnt", "couldn't"),
+    ("wouldnt", "wouldn't"), ("shouldnt", "shouldn't"), ("havent", "haven't"), ("hasnt", "hasn't"),
+    ("im", "I'm"), ("ive", "I've"), ("youre", "you're"), ("theyre", "they're"), ("thats", "that's"),
+    ("whats", "what's"), ("theres", "there's"), ("lets", "let's"),
+];
+/// Hesitation tokens the cleanup drops; they are left out of the draft source.
+const FILLERS: [&str; 12] = [" um", " uh", " Um", " Uh", " umm", " uhm", " erm", " hmm", "um", "uh", "Um", "Uh"];
 
 /// Encodes a deferred `accept` (see `Model::defer_accept`) into `cmd`.
 fn encode_pending(pending: &mut Option<(usize, usize)>, text: &mut Text, wb: &gpu::Buffer, cmd: &mut gpu::Cmd) {
@@ -176,6 +240,8 @@ pub struct Model {
     pending: Option<(usize, usize)>,
     /// Benchmarks only: keep decoding past EOS.
     pub ignore_eos: bool,
+    /// Draft matching key per vocabulary id (`token_key`), built on first use.
+    keys: std::sync::OnceLock<std::sync::Arc<Vec<u64>>>,
 }
 
 impl Model {
@@ -211,6 +277,7 @@ impl Model {
             spec: Some(Spec::default()),
             pending: None,
             ignore_eos: false,
+            keys: std::sync::OnceLock::new(),
         })
     }
 
@@ -488,6 +555,80 @@ impl Model {
         Ok((out, st))
     }
 
+    /// What a cleanup does to the words of a lowercase transcript, applied to a draft word by word: " i"
+    /// becomes " I", a word after a sentence end or in CAPITALIZED gets a capital, CONTRACTIONS get their
+    /// apostrophe. Changed words are re-tokenized; the draft keeps at most its length.
+    fn normalize_draft(&self, draft: &mut Vec<u32>, last: u32) {
+        let k = draft.len();
+        let mut out: Vec<u32> = Vec::with_capacity(k + 4);
+        let mut prev_end = self.tok.token_bytes(last).trim_ascii_end().last().is_some_and(|c| b".?!".contains(c));
+        let mut i = 0;
+        while i < draft.len() && out.len() < k {
+            // a word: a token starting with a space, plus the tokens that continue it
+            let mut j = i + 1;
+            while j < draft.len() && !self.tok.token_bytes(draft[j]).first().is_some_and(|c| !c.is_ascii_alphabetic() && *c != b'\'') {
+                j += 1;
+            }
+            let w: Vec<u8> = draft[i..j].iter().flat_map(|&d| self.tok.token_bytes(d).to_vec()).collect();
+            let mut v = w.clone();
+            if v.len() > 1 && v[0] == b' ' && v[1..].iter().all(|c| c.is_ascii_lowercase()) {
+                let bare = &w[1..];
+                if let Some((_, to)) = CONTRACTIONS.iter().find(|(from, _)| from.as_bytes() == bare) {
+                    v = format!(" {to}").into_bytes();
+                } else if bare == b"i" || prev_end || CAPITALIZED.contains(&bare) {
+                    v[1] = v[1].to_ascii_uppercase();
+                }
+            }
+            match (v != w).then(|| String::from_utf8(v).ok()).flatten() {
+                Some(text) => out.extend(self.tok.encode(&text)),
+                None => out.extend_from_slice(&draft[i..j]),
+            }
+            prev_end = w.trim_ascii_end().last().is_some_and(|c| b".?!".contains(c));
+            i = j;
+        }
+        out.truncate(k);
+        *draft = out;
+    }
+
+    /// Draft source for a user turn: the tokens inside the first SOURCE_TAGS block (all of them if there is
+    /// none), fillers removed.
+    fn draft_source(&self, user: &[u32], keys: &[u64]) -> Source {
+        let mut text = Vec::new();
+        let mut ends = Vec::with_capacity(user.len());
+        for &id in user {
+            text.extend_from_slice(self.tok.token_bytes(id));
+            ends.push(text.len());
+        }
+        let find = |pat: &str, from: usize| {
+            text.get(from..)?.windows(pat.len()).position(|w| w == pat.as_bytes()).map(|i| i + from)
+        };
+        let (lo, hi) = SOURCE_TAGS
+            .iter()
+            .find_map(|(open, close)| {
+                let a = find(open, 0)? + open.len();
+                Some((a, find(close, a)?))
+            })
+            .unwrap_or((0, text.len()));
+        let fillers: Vec<u32> = FILLERS
+            .iter()
+            .filter_map(|f| match self.tok.encode(f).as_slice() {
+                [id] => Some(*id),
+                _ => None,
+            })
+            .collect();
+        let ids: Vec<u32> = (0..user.len())
+            .filter(|&i| ends[i] > lo && ends[i] - self.tok.token_bytes(user[i]).len() >= lo && ends[i] <= hi)
+            .map(|i| user[i])
+            .filter(|id| !fillers.contains(id))
+            .collect();
+        let words = ids
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &id)| Some((keys.get(id as usize).copied().filter(|&k| k & 1 != 0)?, i)))
+            .collect();
+        Source { ids, words }
+    }
+
     /// Prompt-lookup speculation with the adaptive policy (`Policy`): each round drafts the k that maximizes
     /// expected tokens per unit of verify cost, or decodes plainly (pipelined) while speculation does not pay,
     /// scoring shadow rounds on the real output to decide when to switch back. `out` holds the first token.
@@ -504,10 +645,23 @@ impl Model {
     ) {
         let cost = if self.text.cfg.hidden <= 2048 { &VERIFY_COST_2B } else { &VERIFY_COST_4B };
         let mut pol = Policy::new(cost, sp.draft_max);
+        let keys = self.keys.get_or_init(|| {
+            std::sync::Arc::new((0..self.tok.vocab_len() as u32).map(|id| token_key(self.tok.token_bytes(id))).collect())
+        });
+        let keys = std::sync::Arc::clone(keys);
+        let src = self.draft_source(user, &keys);
         let mut seq = user.to_vec();
         seq.extend_from_slice(out);
-        let ulen = user.len();
-        // realized tokens and table cost of the verify rounds so far
+        // where in `src` the last draft's accepted part ended; rounds in a row whose first draft token failed
+        // at source position .0 (a draft from there is not tried a third time)
+        let mut cursor = 0;
+        let mut failed = (usize::MAX, 0);
+        let nl = |id: u32| keys.get(id as usize).is_some_and(|k| k & 2 != 0);
+        let src_nl = src.ids.iter().any(|&id| nl(id));
+        // after a line break the source does not have, list markers or a new paragraph follow, not the draft
+        let brk = |id: u32| nl(id) && !src_nl;
+        let given_up = |f: (usize, usize), j: usize| f.0 == j && f.1 >= 2;
+        // realized tokens and table cost of recent verify rounds (decayed like the policy's counts)
         let (mut got, mut spent, mut rounds) = (0.0, 0.0, 0);
         while out.len() < max_tokens {
             if ext::cancelled() {
@@ -521,10 +675,15 @@ impl Model {
                 return;
             }
             let k = pol.choose(left - 1, KEEP_GAIN).0;
-            if k == 0 {
+            let (mut draft, dpos) = lookup(&src, &seq, &keys, &Spec { draft_max: k, ..sp }, left - 1, cursor);
+            if given_up(failed, dpos) || brk(last) {
+                draft.clear();
+            }
+            if draft.is_empty() {
                 // Plain decoding; shadow rounds (what lookup would have drafted vs what came out) update the
                 // estimate, and speculation resumes once it clears the entry margin.
-                let (mut next_start, mut sh_pos, mut sh): (usize, usize, Vec<u32>) = (seq.len(), 0, Vec::new());
+                let (mut next_start, mut sh_pos, mut sh, mut sh_src): (usize, usize, Vec<u32>, usize) =
+                    (seq.len(), 0, Vec::new(), 0);
                 let stop = |id: u32| {
                     seq.push(id);
                     let j = seq.len() - 1;
@@ -532,20 +691,26 @@ impl Model {
                         let i = j - sh_pos;
                         if seq[j] != sh[i] {
                             pol.update(sh.len(), i);
+                            cursor = sh_src + i;
                             sh.clear();
                             next_start = j + 1;
                         } else if i + 1 == sh.len() {
                             pol.update(sh.len(), sh.len());
+                            cursor = sh_src + sh.len();
                             sh.clear();
                             next_start = j + 2;
                         }
                     }
                     if sh.is_empty() && seq.len() >= next_start {
-                        sh = lookup(&seq, ulen, &sp, usize::MAX);
+                        (sh, sh_src) = lookup(&src, &seq, &keys, &sp, usize::MAX, cursor);
                         sh_pos = seq.len();
                         next_start = seq.len() + 1;
                     }
-                    pol.choose(sp.draft_max, ENTER_GAIN).0 > 0
+                    // switch back only when lookup has a draft for the next round
+                    pol.choose(sp.draft_max, ENTER_GAIN).0 > 0 && !brk(id) && {
+                        let (d, j) = lookup(&src, &seq, &keys, &sp, usize::MAX, cursor);
+                        !d.is_empty() && !given_up(failed, j)
+                    }
                 };
                 match self.decode_plain(last, out, max_tokens, stream, emit, stop) {
                     Some(id) => {
@@ -556,18 +721,22 @@ impl Model {
                     None => return,
                 }
             }
-            let draft = lookup(&seq, ulen, &Spec { draft_max: k, ..sp }, left - 1);
-            let new = if draft.is_empty() {
-                vec![self.step(last)]
-            } else {
+            self.normalize_draft(&mut draft, last);
+            let new = {
                 let mut ids = vec![last];
                 ids.extend_from_slice(&draft);
                 let pred = self.verify(&ids);
                 let m = draft.iter().zip(&pred).take_while(|(d, p)| d == p).count();
                 self.defer_accept(ids.len(), m + 1);
                 pol.update(draft.len(), m);
-                got += (m + 1) as f64;
-                spent += cost[draft.len()];
+                cursor = dpos + m;
+                failed = match (m, failed) {
+                    (0, (p, n)) if p == dpos => (p, n + 1),
+                    (0, _) => (dpos, 1 + brk(pred[m]) as usize),
+                    _ => (usize::MAX, 0),
+                };
+                got = got * Policy::DECAY + (m + 1) as f64;
+                spent = spent * Policy::DECAY + cost[draft.len()];
                 rounds += 1;
                 st.verify_calls += 1;
                 st.drafted += draft.len();

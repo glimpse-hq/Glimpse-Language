@@ -8,8 +8,8 @@
  
  use gpu::Gpu;
  use model::{State, Text, TMAX};
-@@ -509,6 +510,9 @@
-         // realized tokens and table cost of the verify rounds so far
+@@ -663,6 +664,9 @@
+         // realized tokens and table cost of recent verify rounds (decayed like the policy's counts)
          let (mut got, mut spent, mut rounds) = (0.0, 0.0, 0);
          while out.len() < max_tokens {
 +            if ext::cancelled() {
@@ -18,7 +18,7 @@
              let last = *seq.last().unwrap();
              let left = max_tokens - out.len();
              if rounds >= GIVE_UP_ROUNDS && got < KEEP_GAIN * spent {
-@@ -606,6 +610,10 @@
+@@ -775,6 +779,10 @@
          self.text.encode_step(&mut cmd, &self.w.buf, k);
          let mut prev = cmd.commit();
          while out.len() < max_tokens {

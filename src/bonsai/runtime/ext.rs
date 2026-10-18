@@ -177,6 +177,7 @@ impl Idle {
             spec: self.spec,
             ignore_eos: false,
             pending: None,
+            keys: Default::default(),
         }
     }
 }

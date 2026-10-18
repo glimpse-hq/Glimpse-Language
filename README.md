@@ -83,7 +83,7 @@ if availability() == Availability::Available {
 - `release_idle()`: frees the GPU buffers and the cached prompt state (about 235 MB on the 2B, 670 MB on the 4B) and keeps the weights mapped. The next call rebuilds them in a few tens of ms and rereads the adapter.
 - Calls on one `Bonsai` are serialized by a mutex. A runtime panic becomes a `Runtime` error and the model reloads on the next call.
 
-Speculation drafts from the user text (n-grams of 3 down to 1, up to 7 tokens), verifies the drafts in one pass and gives up within a request after three rounds under 20% acceptance. Output is token for token the plain greedy output.
+Speculation drafts up to 7 tokens from the text inside the request's `<transcript>` or `<text>` block (the whole user turn without one): fillers dropped, matched on lowercase words (n-grams of 3 down to 1), with the casing and apostrophes a cleanup adds. Drafts are verified in one pass; the draft length follows recent acceptance, and the request decodes plainly while drafting does not pay. Output is token for token the plain greedy output.
 
 LoRA adapters are safetensors files: bonsai/train.py's export, or PEFT `adapter_model.safetensors` with `adapter_config.json` beside it. Decode cost is 0 to 2%.
 

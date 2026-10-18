@@ -29,94 +29,129 @@ inline float tg_max(float v, threadgroup float* red, uint sid, uint lane, uint n
     return simd_max(r);
 }
 
-// In-place unnormalized Walsh-Hadamard transform over width/512 blocks of 512 in threadgroup memory.
-inline void fwht_tg(threadgroup float* x, uint width, uint tid, uint nt) {
-    uint pairs = width / 2;
-    for (uint h = 1; h < 512; h <<= 1) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint p = tid; p < pairs; p += nt) {
-            uint blk = p >> 8, q = p & 255;
-            uint i = (blk << 9) + (q / h) * 2 * h + (q % h);
-            float a = x[i], b = x[i + h];
-            x[i] = a + b;
-            x[i + h] = a - b;
+// 512-point unnormalized Walsh-Hadamard transform of one block held by a simdgroup in registers: lane l holds
+// elements l + 32 e (e = 0..15), so loads and stores coalesce. Stages h = 1..16 run across lanes, h = 32..256 inside
+// a lane: the same butterflies in the same stage order as an in-memory radix-2 FWHT, so the results are bit-identical
+// to it, with no threadgroup memory or barriers.
+inline void fwht512(thread float* v, uint lane) {
+    _Pragma("clang loop unroll(full)") for (uint m = 1; m < 32; m <<= 1) {
+        bool up = (lane & m) != 0;
+        _Pragma("clang loop unroll(full)") for (uint e = 0; e < 16; e++) {
+            float o = simd_shuffle_xor(v[e], m);
+            v[e] = up ? o - v[e] : v[e] + o;
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    _Pragma("clang loop unroll(full)") for (uint h = 1; h < 16; h <<= 1)
+        _Pragma("clang loop unroll(full)") for (uint e = 0; e < 16; e++)
+            if ((e & h) == 0) {
+                float a = v[e], b = v[e + h];
+                v[e] = a + b;
+                v[e + h] = a - b;
+            }
 }
 
-// Fused LoRA A: rotation kernels get extra threadgroups past the rotation chunks (grid.y >= nch), each serving
-// nsg / 4 rows of u[t, row] = A[row] . x for the unrotated input x, 4 simdgroups per row, 128 values per
-// simdgroup step (one GDN head). R = 0: no extra threadgroups. lred: 32 floats of threadgroup memory.
+// Sum of squares of a row in a fixed order, computed by a 128-thread threadgroup: as if 512 threads each summed x[t],
+// x[t + 512], ..., then a simd_sum per 32 threads and a simd_sum of the 16 partials (simdgroup sid computes partials
+// 4 sid .. 4 sid + 3). Same bits as the 512-thread tg_sum the rotation kernels used before.
+inline float row_ss(device const float* x, uint D, uint sid, uint lane, threadgroup float* red) {
+    float ss[4] = {0, 0, 0, 0};
+    for (uint i0 = 0; i0 < D; i0 += 512)
+        _Pragma("clang loop unroll(full)") for (uint q = 0; q < 4; q++) {
+            uint i = i0 + (sid * 4 + q) * 32 + lane;
+            if (i < D) { float v = x[i]; ss[q] += v * v; }
+        }
+    _Pragma("clang loop unroll(full)") for (uint q = 0; q < 4; q++) {
+        float p = simd_sum(ss[q]);
+        if (lane == 0) red[sid * 4 + q] = p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return simd_sum(lane < 16 ? red[lane] : 0.0f);
+}
+
+// Rotation kernels: 128 threads, simdgroup = one 512 block; grid (T, ceil(D / CHUNK) + LoRA rows), so each rotation
+// threadgroup covers up to 4 blocks (CHUNK values).
+// Fused LoRA A: threadgroups past the rotation chunks (grid.y >= nch) each serve rpt consecutive rows (rpt from the grid,
+// at most LORA_RPT_MAX) of u[t, row] = A[row] . x for the unrotated input x, each row split over the 4 simdgroups,
+// 128 values per simdgroup step (one GDN head). R = 0: none.
+constant uint LORA_RPT_MAX = 4;
 #define LORA_ROW(nch, expr)                                                                     \
     if (tg.y >= nch) {                                                                          \
-        uint per = nt / 128, rl = sid / 4, pi = sid % 4, row = (tg.y - nch) * per + rl;         \
-        float acc = 0;                                                                          \
-        if (row < R) {                                                                          \
-            device const half* a = A + row * K;                                                 \
-            for (uint k = (pi * 32 + lane) * 4; k < K; k += 512)                                \
-                acc += dot(float4(*(device const half4*)(a + k)), (expr));                      \
+        uint rpt = (R + ng.y - nch - 1) / (ng.y - nch), row0 = (tg.y - nch) * rpt;              \
+        for (uint q = 0; q < rpt; q++) {                                                        \
+            uint row = row0 + q;                                                                \
+            float acc = 0;                                                                      \
+            if (row < R) {                                                                      \
+                device const half* a = A + row * K;                                             \
+                for (uint k = (sid * 32 + lane) * 4; k < K; k += 512)                           \
+                    acc += dot(float4(*(device const half4*)(a + k)), (expr));                  \
+            }                                                                                   \
+            acc = simd_sum(acc);                                                                \
+            if (lane == 0) lred[q * 4 + sid] = acc;                                             \
         }                                                                                       \
-        acc = simd_sum(acc);                                                                    \
-        if (lane == 0) lred[sid] = acc;                                                         \
         threadgroup_barrier(mem_flags::mem_threadgroup);                                        \
-        if (row < R && pi == 0 && lane == 0)                                                    \
-            U[t * R + row] = lred[sid] + lred[sid + 1] + lred[sid + 2] + lred[sid + 3];         \
+        uint q = sid * 32 + lane;                                                               \
+        if (q < rpt && row0 + q < R)                                                            \
+            U[t * R + row0 + q] = lred[q * 4] + lred[q * 4 + 1] + lred[q * 4 + 2] + lred[q * 4 + 3]; \
         return;                                                                                 \
     }
 
+// Opaque to the optimizer (z is 0 at run time): pins the order of products that fast math would otherwise reassociate,
+// so results match the earlier threadgroup-memory kernels bit for bit.
+inline float pin(float v, uint z) { return as_type<float>(as_type<uint>(v) ^ z); }
 inline float4 f4(device const float* p) { return *(device const float4*)p; }
 inline float4 silu4(float4 a) { return a / (1.0f + exp(-a)); }
 
-// h[t] -> xn = rmsnorm(h) * w (optional), xr = fwht(signs * xn) / sqrt(512). Grid (T, ceil(D / CHUNK) + LoRA),
-// 512 threads. Every chunk computes the full-row norm in the same order, so results do not depend on the chunking.
+#define ROT_ARGS uint2 tg [[threadgroup_position_in_grid]], uint2 ng [[threadgroups_per_grid]], \
+                 uint sid [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
+#define ROT_LOOP _Pragma("clang loop unroll(full)") for (uint i = 0; i < 16; i++)
+
+// h[t] -> xn = rmsnorm(h) * w (optional), xr = fwht(signs * xn) / sqrt(512).
 kernel void norm_rotate(device const float* h [[buffer(0)]], device const float* w [[buffer(1)]],
                         device const float* signs [[buffer(2)]], device float* xn [[buffer(3)]],
                         device float* xr [[buffer(4)]], constant uint& D [[buffer(5)]],
                         constant uint& write_xn [[buffer(6)]], device const half* A [[buffer(7)]],
-                        device float* U [[buffer(8)]], constant uint& R [[buffer(9)]],
-                        uint2 tg [[threadgroup_position_in_grid]],
-                        uint tid [[thread_index_in_threadgroup]], uint2 ntp [[threads_per_threadgroup]],
-                        uint sid [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float buf[CHUNK];
-    threadgroup float red[32];
-    threadgroup float lred[32];
-    uint K = D, nt = ntp.x, t = tg.x, nch = (D + CHUNK - 1) / CHUNK;
+                        device float* U [[buffer(8)]], constant uint& R [[buffer(9)]], ROT_ARGS) {
+    threadgroup float lred[4 * LORA_RPT_MAX];
+    threadgroup float red[16];
+    uint K = D, t = tg.x, nch = (D + CHUNK - 1) / CHUNK, z = t >> 20;
     device const float* x = h + t * D;
-    float ss = 0;
-    for (uint i = tid; i < D; i += nt) { float v = x[i]; ss += v * v; }
-    float r = rsqrt(tg_sum(ss, red, sid, lane, nt / 32) / float(D) + EPS);
+    // issue this block's loads before the norm so both memory waits overlap
+    uint c0 = tg.y * CHUNK + sid * 512 + lane;
+    bool mine = tg.y < nch && c0 < D;
+    float xv[16], wv[16], sv[16];
+    if (mine) ROT_LOOP { uint e = c0 + 32 * i; xv[i] = x[e]; wv[i] = w[e]; sv[i] = signs[e]; }
+    float r = rsqrt(row_ss(x, D, sid, lane, red) / float(D) + EPS);
     LORA_ROW(nch, f4(x + k) * r * f4(w + k))
-    uint c0 = tg.y * CHUNK, n = min(CHUNK, D - c0);
-    for (uint i = tid; i < n; i += nt) {
-        float v = x[c0 + i] * r * w[c0 + i];
-        if (write_xn) xn[t * D + c0 + i] = v;
-        buf[i] = v * signs[c0 + i];
+    if (!mine) return;
+    float v[16];
+    ROT_LOOP {
+        uint e = c0 + 32 * i;
+        float a = pin(pin(xv[i] * r, z) * wv[i], z);
+        if (write_xn) xn[t * D + e] = a;
+        v[i] = a * sv[i];
     }
-    fwht_tg(buf, n, tid, nt);
-    for (uint i = tid; i < n; i += nt) xr[t * D + c0 + i] = buf[i] * INV_SQRT512;
+    fwht512(v, lane);
+    ROT_LOOP xr[t * D + c0 + 32 * i] = v[i] * INV_SQRT512;
 }
 
 // xr = fwht(signs * silu(g) * u) (MLP down input).
 kernel void swiglu_rotate(device const float* g [[buffer(0)]], device const float* u [[buffer(1)]],
                           device const float* signs [[buffer(2)]], device float* xr [[buffer(3)]],
                           constant uint& D [[buffer(4)]], device const half* A [[buffer(5)]],
-                          device float* U [[buffer(6)]], constant uint& R [[buffer(7)]],
-                          uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                          uint2 ntp [[threads_per_threadgroup]], uint sid [[simdgroup_index_in_threadgroup]],
-                          uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float buf[CHUNK];
-    threadgroup float lred[32];
-    uint K = D, nt = ntp.x, t = tg.x, nch = (D + CHUNK - 1) / CHUNK;
+                          device float* U [[buffer(6)]], constant uint& R [[buffer(7)]], ROT_ARGS) {
+    threadgroup float lred[4 * LORA_RPT_MAX];
+    uint K = D, t = tg.x, nch = (D + CHUNK - 1) / CHUNK, z = t >> 20;
     LORA_ROW(nch, silu4(f4(g + t * D + k)) * f4(u + t * D + k))
-    uint c0 = tg.y * CHUNK, n = min(CHUNK, D - c0);
-    for (uint i = tid; i < n; i += nt) {
-        uint e = t * D + c0 + i;
-        float a = g[e];
-        buf[i] = (a / (1.0f + exp(-a))) * u[e] * signs[c0 + i];
+    uint c0 = tg.y * CHUNK + sid * 512 + lane;
+    if (c0 >= D) return;
+    float v[16];
+    ROT_LOOP {
+        uint e = c0 + 32 * i;
+        float a = g[t * D + e];
+        v[i] = pin(pin(a * u[t * D + e], z) * pin(1.0f / (1.0f + exp(-a)), z), z) * signs[e];
     }
-    fwht_tg(buf, n, tid, nt);
-    for (uint i = tid; i < n; i += nt) xr[t * D + c0 + i] = buf[i] * INV_SQRT512;
+    fwht512(v, lane);
+    ROT_LOOP xr[t * D + c0 + 32 * i] = v[i] * INV_SQRT512;
 }
 
 inline float4 sigmoid4(float4 a) { return 1.0f / (1.0f + exp(-a)); }
@@ -126,22 +161,21 @@ inline float4 sigmoid4(float4 a) { return 1.0f / (1.0f + exp(-a)); }
 kernel void gate_rotate(device const float* attn [[buffer(0)]], device const float* qp [[buffer(1)]],
                         device const float* signs [[buffer(2)]], device float* xr [[buffer(3)]],
                         constant uint& W [[buffer(4)]], device const half* A [[buffer(5)]],
-                        device float* U [[buffer(6)]], constant uint& R [[buffer(7)]],
-                        uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                        uint2 ntp [[threads_per_threadgroup]], uint sid [[simdgroup_index_in_threadgroup]],
-                        uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float buf[CHUNK];
-    threadgroup float lred[32];
-    uint K = W, nt = ntp.x, t = tg.x, nch = (W + CHUNK - 1) / CHUNK;
+                        device float* U [[buffer(6)]], constant uint& R [[buffer(7)]], ROT_ARGS) {
+    threadgroup float lred[4 * LORA_RPT_MAX];
+    uint K = W, t = tg.x, nch = (W + CHUNK - 1) / CHUNK, z = t >> 20;
     LORA_ROW(nch, f4(attn + t * W + k) * sigmoid4(f4(qp + t * 2 * W + (k >> 8) * 512 + 256 + (k & 255))))
-    uint c0 = tg.y * CHUNK, n = min(CHUNK, W - c0);
-    for (uint i = tid; i < n; i += nt) {
-        uint e = c0 + i, hd = e >> 8, d = e & 255;
+    uint c0 = tg.y * CHUNK + sid * 512 + lane;
+    if (c0 >= W) return;
+    float v[16];
+    ROT_LOOP {
+        uint e = c0 + 32 * i, hd = e >> 8, d = e & 255;
         float gt = qp[t * 2 * W + hd * 512 + 256 + d];
-        buf[i] = attn[t * W + e] * (1.0f / (1.0f + exp(-gt))) * signs[e];
+        float a = attn[t * W + e];
+        v[i] = pin(a * pin(1.0f / (1.0f + exp(-gt)), z), z) * signs[e];
     }
-    fwht_tg(buf, n, tid, nt);
-    for (uint i = tid; i < n; i += nt) xr[t * W + c0 + i] = buf[i] * INV_SQRT512;
+    fwht512(v, lane);
+    ROT_LOOP xr[t * W + c0 + 32 * i] = v[i] * INV_SQRT512;
 }
 
 // GDN head output for the 4 values at k (one simdgroup covers a 128-wide head): rmsnorm(y) * w * silu(z).
@@ -151,57 +185,84 @@ inline float4 gated4(device const float* y, device const float* z, device const 
     return silu4(f4(z + k)) * (v * r * f4(w + (k & 127)));
 }
 
-// GDN output: per head (128) rmsnorm(y) * w * silu(z), then rotate. W = v heads * 128 (multiple of CHUNK).
-// 512 threads x 4 values per chunk, simdgroup = head.
-kernel void gated_norm_rotate(device const float* y [[buffer(0)]], device const float* z [[buffer(1)]],
+// GDN output: per head (128) rmsnorm(y) * w * silu(z), then rotate. W = v heads * 128 (multiple of 512).
+// The head norms use the layout of gated4 (lane l: values 4 l .. 4 l + 3 of the head).
+kernel void gated_norm_rotate(device const float* y [[buffer(0)]], device const float* zg [[buffer(1)]],
                               device const float* w [[buffer(2)]], device const float* signs [[buffer(3)]],
                               device float* xr [[buffer(4)]], constant uint& W [[buffer(5)]],
                               device const half* A [[buffer(6)]], device float* U [[buffer(7)]],
-                              constant uint& R [[buffer(8)]],
-                              uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                              uint sid [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float buf[CHUNK];
-    threadgroup float lred[32];
-    uint K = W, nt = 512, t = tg.x, nch = W / CHUNK;
-    LORA_ROW(nch, gated4(y + t * W, z + t * W, w, k))
-    uint c0 = tg.y * CHUNK;
-    uint e0 = tid * 4;
-    float4 v = *(device const float4*)(y + t * W + c0 + e0);
-    float r = rsqrt(simd_sum(dot(v, v)) / 128.0f + EPS);
-    float4 zz = *(device const float4*)(z + t * W + c0 + e0);
-    for (uint j = 0; j < 4; j++) {
-        uint e = e0 + j;
-        float x = v[j] * r * w[e & 127];
-        float a = zz[j];
-        buf[e] = (a / (1.0f + exp(-a))) * x * signs[c0 + e];
+                              constant uint& R [[buffer(8)]], ROT_ARGS) {
+    threadgroup float lred[4 * LORA_RPT_MAX];
+    uint K = W, t = tg.x, nch = (W + CHUNK - 1) / CHUNK, z = t >> 20;
+    LORA_ROW(nch, gated4(y + t * W, zg + t * W, w, k))
+    uint b0 = tg.y * CHUNK + sid * 512;
+    if (b0 >= W) return;
+    device const float* yr = y + t * W;
+    uint c0 = b0 + lane;
+    float4 yh[4];
+    float yv[16], zv[16], wv[16], sv[16];
+    _Pragma("clang loop unroll(full)") for (uint hh = 0; hh < 4; hh++) yh[hh] = f4(yr + b0 + hh * 128 + lane * 4);
+    ROT_LOOP { uint e = c0 + 32 * i; yv[i] = yr[e]; zv[i] = zg[t * W + e]; wv[i] = w[e & 127]; sv[i] = signs[e]; }
+    float rh[4];
+    _Pragma("clang loop unroll(full)") for (uint hh = 0; hh < 4; hh++)
+        rh[hh] = rsqrt(simd_sum(dot(yh[hh], yh[hh])) / 128.0f + EPS);
+    float v[16];
+    ROT_LOOP {
+        float a = zv[i];
+        // a * y * r * w * sigmoid(a): the product order of the earlier kernel
+        v[i] = pin(pin(pin(pin(a * yv[i], z) * rh[i / 4], z) * wv[i], z) * pin(1.0f / (1.0f + exp(-a)), z), z) * sv[i];
     }
-    fwht_tg(buf, CHUNK, tid, 512);
-    for (uint j = 0; j < 4; j++) xr[t * W + c0 + e0 + j] = buf[e0 + j] * INV_SQRT512;
+    fwht512(v, lane);
+    ROT_LOOP xr[t * W + c0 + 32 * i] = v[i] * INV_SQRT512;
 }
 
 // Embedding: row = (code - 1) * scale (fp16), inverse transform: fwht then * signs, rounded to fp16.
-// Grid (T, ceil(D / CHUNK)).
+// Grid (T, ceil(D / CHUNK)), 128 threads.
 kernel void embed(device const uint* W [[buffer(0)]], device const half* S [[buffer(1)]],
                   device const float* signs [[buffer(2)]], device const int* ids [[buffer(3)]],
-                  device float* out [[buffer(4)]], constant uint& D [[buffer(5)]],
-                  uint2 tg [[threadgroup_position_in_grid]],
-                  uint tid [[thread_index_in_threadgroup]], uint2 ntp [[threads_per_threadgroup]]) {
-    threadgroup float buf[CHUNK];
-    uint t = tg.x, c0 = tg.y * CHUNK, n = min(CHUNK, D - c0), nt = ntp.x;
+                  device float* out [[buffer(4)]], constant uint& D [[buffer(5)]], ROT_ARGS) {
+    uint t = tg.x, c0 = tg.y * CHUNK + sid * 512 + lane;
+    if (c0 >= D) return;
     uint row = uint(ids[t]);
     uint kw = D / 16, kg = D / 128;
-    for (uint i = tid; i < n; i += nt) {
-        uint k = c0 + i;
+    float v[16];
+    ROT_LOOP {
+        uint k = c0 + 32 * i;
         uint wd = W[row * kw + (k >> 4)];
         float c = float((wd >> (2 * (k & 15))) & 3u) - 1.0f;
-        buf[i] = float(half(c * float(S[row * kg + (k >> 7)])));
+        v[i] = float(half(c * float(S[row * kg + (k >> 7)])));
     }
-    fwht_tg(buf, n, tid, nt);
-    for (uint i = tid; i < n; i += nt) out[t * D + c0 + i] = float(half(buf[i] * INV_SQRT512 * signs[c0 + i]));
+    fwht512(v, lane);
+    ROT_LOOP out[t * D + c0 + 32 * i] = float(half(v[i] * INV_SQRT512 * signs[c0 + 32 * i]));
 }
 
 // Shared matvec body: R rows from row0, 16 codes per lane per step (fp16-trick decode, x pre-scaled per slot).
 // LoRA epilogue when lr > 0: y[row] += Bm[row, 0..lr) . u (Bm fp16 [rows, lr], alpha / r folded in).
+// LoRA up projection of one output, summed in order: the value a separate pass would add after the matmul.
+inline float lora_acc(device const float* ut, device const half* br, uint r) {
+    float acc = 0;
+    for (uint j = 0; j < r; j++) acc += ut[j] * float(br[j]);
+    return acc;
+}
+
+// Post-add LoRA (T > 1 kernels): y = (add ? y + v : v) + lora_acc, the order of the earlier separate lora_b pass.
+inline void store_post(device float* y, float v, uint add, device const half* br, device const float* ut, uint r) {
+    float yv = add ? *y + v : v;
+    if (r) yv = pin(yv, add >> 1) + lora_acc(ut, br, r);
+    *y = yv;
+}
+
+// One GDN a/b gate row (dense fp32 matvec), one simdgroup.
+inline void gdn_ab_row(device const float* Wa, device const float* Wb, device const float* x, device float* out,
+                       uint NV, uint K, uint row, uint t, uint lane) {
+    device const float* w = row < NV ? Wa + row * K : Wb + (row - NV) * K;
+    float acc = 0;
+    _Pragma("clang loop unroll_count(4)")
+    for (uint i = lane * 4; i < K; i += 128) acc += dot(*(device const float4*)(w + i), *(device const float4*)(x + t * K + i));
+    acc = simd_sum(acc);
+    if (lane == 0) out[t * 2 * NV + row] = acc;
+}
+
 template <int R>
 inline void qmv_rows(device const uint* W, device const half* S, device const float* x, device float* y,
                      uint K, uint row0, uint add, uint lane, device const half* Bm, device const float* u, uint lr) {
@@ -263,6 +324,24 @@ kernel void qmvr(device const uint* W [[buffer(0)]], device const half* S [[buff
     qmv_rows<4>(W, S, X + t * K, Y + t * O, K, (tg * 2 + sid % 2) * 4, add, lane, S, X, 0u);
 }
 
+// LoRA up projection after qmvr (T = 2, 3; a separate pass keeps qmvr's loop lean), added to up to three
+// outputs: Y_i[t, o] += B_i[o] . u[t, i r .. (i + 1) r), B_i fp16 [O_i, r] (alpha / r folded in). Rows of output i
+// follow output i - 1. Grid (ceil(total / 256), T), 256 threads.
+kernel void lora_b(device const half* B0 [[buffer(0)]], device float* Y0 [[buffer(1)]],
+                   device const half* B1 [[buffer(2)]], device float* Y1 [[buffer(3)]],
+                   device const half* B2 [[buffer(4)]], device float* Y2 [[buffer(5)]],
+                   device const float* u [[buffer(6)]], constant uint& O0 [[buffer(7)]], constant uint& O1 [[buffer(8)]],
+                   constant uint& O2 [[buffer(9)]], constant uint& r [[buffer(10)]], constant uint& R [[buffer(11)]],
+                   uint2 gp [[thread_position_in_grid]]) {
+    uint o = gp.x, t = gp.y;
+    device const half* b; device float* y; uint O, i;
+    if (o < O0) { b = B0; y = Y0; O = O0; i = 0; }
+    else if (o < O0 + O1) { b = B1; y = Y1; O = O1; i = 1; o -= O0; }
+    else if (o < O0 + O1 + O2) { b = B2; y = Y2; O = O2; i = 2; o -= O0 + O1; }
+    else return;
+    y[t * O + o] += lora_acc(u + t * R + i * r, b + o * r, r);
+}
+
 // Up to three matvecs sharing one input in a single dispatch (rows of matrix i follow matrix i-1).
 // Same inner loop as qmv4: 2 simdgroups x 4 rows per threadgroup, 16 codes per lane per step.
 // LoRA epilogue when lr > 0: matrix i uses B_i and u + i * lr.
@@ -273,8 +352,15 @@ kernel void qmv3(device const uint* W0 [[buffer(0)]], device const half* S0 [[bu
                  constant uint& O1 [[buffer(12)]], device const half* B0 [[buffer(13)]],
                  device const half* B1 [[buffer(14)]], device const half* B2 [[buffer(15)]],
                  device const float* u [[buffer(16)]], constant uint& lr [[buffer(17)]],
+                 device const float* Wa [[buffer(18)]], device const float* Wb [[buffer(19)]],
+                 device const float* xn [[buffer(20)]], device float* ab [[buffer(21)]], constant uint& NV [[buffer(22)]],
+                 constant uint& OT [[buffer(23)]],
                  uint tg [[threadgroup_position_in_grid]],
                  uint sid [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    if (tg * 8 >= OT) {  // GDN a/b gate rows ride along (2 per threadgroup)
+        gdn_ab_row(Wa, Wb, xn, ab, NV, K, (tg - OT / 8) * 2 + sid, 0, lane);
+        return;
+    }
     uint r = (tg * 2 + sid) * 4;
     device const uint* W; device const half* S; device float* y; device const half* B;
     if (r < O0) { W = W0; S = S0; y = Y0; B = B0; }
@@ -289,7 +375,9 @@ kernel void qmv3(device const uint* W0 [[buffer(0)]], device const half* S0 [[bu
 kernel void qmm3(device const uint* W [[buffer(0)]], device const half* S [[buffer(1)]],
                  device const float* X [[buffer(2)]], device float* Y [[buffer(3)]],
                  constant uint& K [[buffer(4)]], constant uint& O [[buffer(5)]], constant uint& add [[buffer(6)]],
-                 constant uint& T [[buffer(7)]], uint2 tg [[threadgroup_position_in_grid]],
+                 constant uint& T [[buffer(7)]], device const half* Bm [[buffer(8)]], device const float* u [[buffer(9)]],
+                 constant uint& lr [[buffer(10)]], constant uint& UR [[buffer(11)]],
+                 uint2 tg [[threadgroup_position_in_grid]],
                  uint tid [[thread_index_in_threadgroup]], uint sid [[simdgroup_index_in_threadgroup]]) {
     threadgroup float buf[2048];
     threadgroup float* xs = buf;                              // [32 tokens][32 k] float
@@ -334,11 +422,7 @@ kernel void qmm3(device const uint* W [[buffer(0)]], device const half* S [[buff
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint e = tid; e < 32 * 64; e += 128) {
         uint tt = t0 + e / 64, n = n0 + e % 64;
-        if (tt < T) {
-            uint o = tt * O + n;
-            float v = buf[e];
-            Y[o] = add ? Y[o] + v : v;
-        }
+        if (tt < T) store_post(Y + tt * O + n, buf[e], add, Bm + n * lr, u + tt * UR, lr);
     }
 }
 
@@ -350,13 +434,7 @@ kernel void gdn_ab(device const float* Wa [[buffer(0)]], device const float* Wb 
                    constant uint& NV [[buffer(4)]], constant uint& K [[buffer(5)]],
                    uint2 tg [[threadgroup_position_in_grid]], uint sid [[simdgroup_index_in_threadgroup]],
                    uint lane [[thread_index_in_simdgroup]]) {
-    uint row = tg.x * 4 + sid;
-    uint t = tg.y;
-    device const float* w = row < NV ? Wa + row * K : Wb + (row - NV) * K;
-    float acc = 0;
-    for (uint i = lane * 4; i < K; i += 128) acc += dot(*(device const float4*)(w + i), *(device const float4*)(x + t * K + i));
-    acc = simd_sum(acc);
-    if (lane == 0) out[t * 2 * NV + row] = acc;
+    gdn_ab_row(Wa, Wb, x, out, NV, K, tg.x * 4 + sid, tg.y, lane);
 }
 
 // Causal depthwise conv (kernel 4) over [state(3 rows), qkv(T rows)], silu, then q/k rmsnorm per head.
@@ -483,7 +561,9 @@ kernel void attn_prep(device const float* qp [[buffer(0)]], device const float* 
 kernel void qmvx(device const uint* W [[buffer(0)]], device const half* S [[buffer(1)]],
                  device const float* X [[buffer(2)]], device float* Y [[buffer(3)]],
                  constant uint& K [[buffer(4)]], constant uint& O [[buffer(5)]], constant uint& add [[buffer(6)]],
-                 constant uint& T [[buffer(7)]], uint tg [[threadgroup_position_in_grid]],
+                 constant uint& T [[buffer(7)]], device const half* Bm [[buffer(8)]], device const float* u [[buffer(9)]],
+                 constant uint& lr [[buffer(10)]], constant uint& UR [[buffer(11)]],
+                 uint tg [[threadgroup_position_in_grid]],
                  uint sid [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     uint n0 = (tg * 4 + sid) * 8;
     uint qid = lane / 4;
@@ -509,11 +589,7 @@ kernel void qmvx(device const uint* W [[buffer(0)]], device const half* S [[buff
     }
     for (uint e = 0; e < 2; e++) {
         uint t = fm, n = n0 + fn + e;
-        if (t < T) {
-            uint o = t * O + n;
-            float v = c.thread_elements()[e];
-            Y[o] = add ? Y[o] + v : v;
-        }
+        if (t < T) store_post(Y + t * O + n, c.thread_elements()[e], add, Bm + n * lr, u + t * UR, lr);
     }
 }
 
@@ -563,6 +639,8 @@ kernel void attn_split(device const float* q [[buffer(0)]], device const float* 
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float acc[4] = {0, 0, 0, 0};
+    // unrolled so the value loads of several keys are in flight at once (same summation order)
+    _Pragma("clang loop unroll_count(8)")
     for (uint i = 0; i < cnt; i++) {
         float v = vc[((j0 + i) * KV + kh) * 256 + tid];
         for (uint h = 0; h < 4; h++) acc[h] += sc[h * 512 + i] * v;
@@ -591,27 +669,6 @@ kernel void attn_combine(device const float* part [[buffer(0)]], device float* o
         a += p[s * 258 + 2 + d] * w;
     }
     out[t * H * 256 + h * 256 + d] = a / L;
-}
-
-// LoRA up projection for T > 1 (decode uses the qmv epilogue), added to up to three outputs:
-// Y_i[t, o] += B_i[o] . u[t, i r .. (i + 1) r), B_i fp16 [O_i, r] (alpha / r folded in). Rows of output i follow output i - 1. Grid (ceil(total / 256), T), 256 threads.
-kernel void lora_b(device const half* B0 [[buffer(0)]], device float* Y0 [[buffer(1)]],
-                   device const half* B1 [[buffer(2)]], device float* Y1 [[buffer(3)]],
-                   device const half* B2 [[buffer(4)]], device float* Y2 [[buffer(5)]],
-                   device const float* u [[buffer(6)]], constant uint& O0 [[buffer(7)]], constant uint& O1 [[buffer(8)]],
-                   constant uint& O2 [[buffer(9)]], constant uint& r [[buffer(10)]], constant uint& R [[buffer(11)]],
-                   uint2 gp [[thread_position_in_grid]]) {
-    uint o = gp.x, t = gp.y;
-    device const half* b; device float* y; uint O, i;
-    if (o < O0) { b = B0; y = Y0; O = O0; i = 0; }
-    else if (o < O0 + O1) { b = B1; y = Y1; O = O1; i = 1; o -= O0; }
-    else if (o < O0 + O1 + O2) { b = B2; y = Y2; O = O2; i = 2; o -= O0 + O1; }
-    else return;
-    device const float* ut = u + t * R + i * r;
-    device const half* br = b + o * r;
-    float acc = 0;
-    for (uint j = 0; j < r; j++) acc += ut[j] * float(br[j]);
-    y[t * O + o] += acc;
 }
 
 // Argmax over V per row, stage 1: each threadgroup scans a slice, writes (value, index).
@@ -815,3 +872,4 @@ kernel void v_flash(device const half* q [[buffer(0)]], device const half* k [[b
         }
     }
 }
+

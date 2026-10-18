@@ -299,6 +299,11 @@ impl Tokenizer {
         out.extend(syms);
     }
 
+    /// Number of token ids.
+    pub fn vocab_len(&self) -> usize {
+        self.offs.len() - 1
+    }
+
     pub fn token_bytes(&self, id: u32) -> &[u8] {
         let i = id as usize;
         &self.blob[self.offs[i] as usize..self.offs[i + 1] as usize]

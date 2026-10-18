@@ -437,22 +437,24 @@ impl Text {
         Some((ls.lora.groups.get(layer)?[g].as_ref()?, ls))
     }
 
-    /// Extra arguments and threadgroups for a rotation kernel that computes LoRA A of `group` on the side.
-    fn rot_lora<'a>(&'a self, group: Option<(&'a Group, &'a LoraState)>, threads: usize) -> ([Arg<'a>; 3], usize) {
+    /// Extra arguments and threadgroups for a rotation kernel that computes LoRA A of `group` on the side,
+    /// `rpt` rows per threadgroup (1 to LORA_RPT_MAX in kernels.metal).
+    fn rot_lora<'a>(&'a self, group: Option<(&'a Group, &'a LoraState)>, rpt: usize) -> ([Arg<'a>; 3], usize) {
         match group {
             Some((g, ls)) => (
                 [B(&ls.lora.buf, g.a).into(), B(&ls.u, 0).into(), (g.rows() as u32).into()],
-                g.rows().div_ceil(threads / 128),
+                g.rows().div_ceil(rpt),
             ),
             None => ([B(&self.s.xr, 0).into(), B(&self.s.xr, 0).into(), 0u32.into()], 0),
         }
     }
 
     /// Matmuls sharing input `x`, plus the LoRA up projection of `group` (its u is already computed).
-    fn qmm_lora(&self, cmd: &mut Cmd, wb: &Buffer, ls: &[(Lin, B)], x: B, t: usize, add: bool, group: Option<(&Group, &LoraState)>) {
+    #[allow(clippy::too_many_arguments)]
+    fn qmm_lora(&self, cmd: &mut Cmd, wb: &Buffer, ls: &[(Lin, B)], x: B, t: usize, add: bool, group: Option<(&Group, &LoraState)>, ab: Option<[Arg; 5]>) {
         if t == 1 && ls.len() > 1 {
             assert!(!add);
-            return self.qmm_multi(cmd, wb, ls, x, group);
+            return self.qmm_multi(cmd, wb, ls, x, group, ab);
         }
         if t == 1 {
             let (l, y) = ls[0];
@@ -474,10 +476,14 @@ impl Text {
             ];
             return cmd.run("qmv4", &args, (l.o / 8, 1, 1), (64, 1, 1));
         }
-        for (l, y) in ls {
-            self.qmm(cmd, wb, *l, x, *y, t, add);
+        // T >= 4: the LoRA up projection is added in each matmul's store (u rows of R floats, member i at i * r);
+        // T = 2, 3: by one lora_b pass after the group (qmvr's loop slows down with it inside)
+        let post = t > 3;
+        for (i, (l, y)) in ls.iter().enumerate() {
+            let lora = group.filter(|_| post).map(|(g, st)| (B(&st.lora.buf, g.b[i]), B(&st.u, i * g.r * 4), g.r, g.rows()));
+            self.qmm(cmd, wb, *l, x, *y, t, add, lora);
         }
-        if let Some((g, st)) = group {
+        if let Some((g, st)) = group.filter(|_| !post) {
             let lb = &st.lora.buf;
             let mut args: Vec<Arg> = Vec::with_capacity(12);
             let mut os = [0u32; 3];
@@ -500,44 +506,43 @@ impl Text {
         }
     }
 
-    fn qmm(&self, cmd: &mut Cmd, wb: &Buffer, l: Lin, x: B, y: B, t: usize, add: bool) {
+    /// T > 1 matmul y (+)= x W^T, plus the LoRA up projection (B, u, r, row stride of u) in the store.
+    #[allow(clippy::too_many_arguments)]
+    fn qmm(&self, cmd: &mut Cmd, wb: &Buffer, l: Lin, x: B, y: B, t: usize, add: bool, lora: Option<(B, B, usize, usize)>) {
         assert!(t > 1, "t == 1 goes through qmm_lora");
-        let args: [Arg; 8] = [
-            B(wb, l.w).into(),
-            B(wb, l.s).into(),
-            x.into(),
-            y.into(),
-            (l.k as u32).into(),
-            (l.o as u32).into(),
-            (add as u32).into(),
-            (t as u32).into(),
-        ];
+        let (lb, lu, lr, ur) = lora.unwrap_or((B(&self.s.xr, 0), B(&self.s.xr, 0), 0, 0));
+        let args = |c: usize, n: usize| -> [Arg; 12] {
+            [
+                B(wb, l.w).into(),
+                B(wb, l.s).into(),
+                B(x.0, x.1 + c * l.k * 4).into(),
+                B(y.0, y.1 + c * l.o * 4).into(),
+                (l.k as u32).into(),
+                (l.o as u32).into(),
+                (add as u32).into(),
+                (n as u32).into(),
+                lb.into(),
+                B(lu.0, lu.1 + c * ur * 4).into(),
+                (lr as u32).into(),
+                (ur as u32).into(),
+            ]
+        };
         if t <= 3 {
             // qmv4's math per row (same results as a decode step); the T copies share each weight read
-            cmd.run("qmvr", &args, (l.o / 8, 1, 1), (64 * t, 1, 1));
+            cmd.run("qmvr", &args(0, t)[..8], (l.o / 8, 1, 1), (64 * t, 1, 1));
         } else if t <= 16 {
             // verify batches: MMA with X as the A operand, 8 rows per pass
             for c in (0..t).step_by(8) {
-                let n = (t - c).min(8);
-                let a: [Arg; 8] = [
-                    B(wb, l.w).into(),
-                    B(wb, l.s).into(),
-                    B(x.0, x.1 + c * l.k * 4).into(),
-                    B(y.0, y.1 + c * l.o * 4).into(),
-                    (l.k as u32).into(),
-                    (l.o as u32).into(),
-                    (add as u32).into(),
-                    (n as u32).into(),
-                ];
-                cmd.run("qmvx", &a, (l.o / 32, 1, 1), (128, 1, 1));
+                cmd.run("qmvx", &args(c, (t - c).min(8)), (l.o / 32, 1, 1), (128, 1, 1));
             }
         } else {
-            cmd.run("qmm3", &args, (l.o / 64, t.div_ceil(32), 1), (128, 1, 1));
+            cmd.run("qmm3", &args(0, t), (l.o / 64, t.div_ceil(32), 1), (128, 1, 1));
         }
     }
 
     /// Single-token matvecs sharing input `x` in one dispatch, with the LoRA epilogue of `group`.
-    fn qmm_multi(&self, cmd: &mut Cmd, wb: &Buffer, ls: &[(Lin, B)], x: B, group: Option<(&Group, &LoraState)>) {
+    /// `ab`: GDN a/b gate projection (Wa, Wb, normed input, output, NV) computed by extra threadgroups.
+    fn qmm_multi(&self, cmd: &mut Cmd, wb: &Buffer, ls: &[(Lin, B)], x: B, group: Option<(&Group, &LoraState)>, ab: Option<[Arg; 5]>) {
         let mut args: Vec<Arg> = Vec::with_capacity(18);
         for i in 0..3 {
             let (l, y) = ls[i.min(ls.len() - 1)];
@@ -566,7 +571,16 @@ impl Text {
                 args.push(0u32.into());
             }
         }
-        cmd.run("qmv3", &args, (total / 8, 1, 1), (64, 1, 1));
+        let dummy = || -> Arg { B(&self.s.xr, 0).into() };
+        let a = ab.unwrap_or([dummy(), dummy(), dummy(), dummy(), 0u32.into()]);
+        let extra = match a[4] {
+            Arg::U32(v) => v as usize,
+            _ => unreachable!(),
+        };
+        args.extend(a);
+        args.push((total as u32).into());
+        // NV extra threadgroups of 2 simdgroups: the 2 NV a/b rows
+        cmd.run("qmv3", &args, (total / 8 + extra, 1, 1), (64, 1, 1));
     }
 
     pub fn encode_embed(&self, cmd: &mut Cmd, wb: &Buffer, t: usize) {
@@ -588,7 +602,7 @@ impl Text {
                 (d as u32).into(),
             ],
             (t, d.div_ceil(CHUNK), 1),
-            (512, 1, 1),
+            (128, 1, 1),
         );
     }
 
@@ -609,6 +623,8 @@ impl Text {
         let st = &self.state;
         let off = st.len as u32;
         let f = 4usize;
+        // LoRA A rows per threadgroup: one for decode latency, four for prefill (one norm per four rows)
+        let rpt = if t == 1 { 1 } else { 4 };
         for (li, l) in self.layers.iter().enumerate() {
             let first = match &l.mixer {
                 Mixer::Gdn { qkv, .. } => qkv,
@@ -616,7 +632,7 @@ impl Text {
             };
             let is_gdn = matches!(l.mixer, Mixer::Gdn { .. });
             let g: [_; 4] = std::array::from_fn(|i| self.group(li, i));
-            let (la, ln) = self.rot_lora(g[0], 512);
+            let (la, ln) = self.rot_lora(g[0], rpt);
             let [a0, a1, a2] = la;
             cmd.run(
                 "norm_rotate",
@@ -633,7 +649,7 @@ impl Text {
                     a2,
                 ],
                 (t, d.div_ceil(CHUNK) + ln, 1),
-                (512, 1, 1),
+                (128, 1, 1),
             );
             match &l.mixer {
                 Mixer::Gdn {
@@ -664,21 +680,25 @@ impl Text {
                     } else {
                         (conv_in, gdn_in)
                     };
-                    self.qmm_lora(cmd, wb, &[(*qkv, qkv_b), (*z, B(&s.a2, 0))], B(&s.xr, 0), t, false, g[0]);
-                    cmd.run(
-                        "gdn_ab",
-                        &[
-                            B(wb, *a).into(),
-                            B(wb, *b).into(),
-                            B(&s.xn, 0).into(),
-                            ab_b.into(),
-                            (nv as u32).into(),
-                            (d as u32).into(),
-                        ],
-                        (2 * nv / 4, t, 1),
-                        (128, 1, 1),
-                    );
+                    // decode: the a/b gate projection rides along in the qkv/z matvec dispatch
                     let fused = t == 1 && !verify;
+                    let ab_args: [Arg; 5] = [B(wb, *a).into(), B(wb, *b).into(), B(&s.xn, 0).into(), ab_b.into(), (nv as u32).into()];
+                    self.qmm_lora(cmd, wb, &[(*qkv, qkv_b), (*z, B(&s.a2, 0))], B(&s.xr, 0), t, false, g[0], fused.then_some(ab_args));
+                    if !fused {
+                        cmd.run(
+                            "gdn_ab",
+                            &[
+                                B(wb, *a).into(),
+                                B(wb, *b).into(),
+                                B(&s.xn, 0).into(),
+                                ab_b.into(),
+                                (nv as u32).into(),
+                                (d as u32).into(),
+                            ],
+                            (2 * nv / 4, t, 1),
+                            (128, 1, 1),
+                        );
+                    }
                     cmd.run(
                         "gdn_conv",
                         &[
@@ -718,7 +738,7 @@ impl Text {
                         (nv, 32, 1),
                         (32, 4, 1),
                     );
-                    let ([a0, a1, a2], ln) = self.rot_lora(g[1], 512);
+                    let ([a0, a1, a2], ln) = self.rot_lora(g[1], rpt);
                     cmd.run(
                         "gated_norm_rotate",
                         &[
@@ -733,9 +753,9 @@ impl Text {
                             a2,
                         ],
                         (t, gw / CHUNK + ln, 1),
-                        (512, 1, 1),
+                        (128, 1, 1),
                     );
-                    self.qmm_lora(cmd, wb, &[(*out, B(&s.h, 0))], B(&s.xr, 0), t, true, g[1]);
+                    self.qmm_lora(cmd, wb, &[(*out, B(&s.h, 0))], B(&s.xr, 0), t, true, g[1], None);
                 }
                 Mixer::Attn {
                     q,
@@ -747,7 +767,7 @@ impl Text {
                     idx,
                 } => {
                     let outs = [B(&s.a1, 0), B(&s.kp, 0), B(&s.vp, 0)];
-                    self.qmm_lora(cmd, wb, &[(*q, outs[0]), (*k, outs[1]), (*v, outs[2])], B(&s.xr, 0), t, false, g[0]);
+                    self.qmm_lora(cmd, wb, &[(*q, outs[0]), (*k, outs[1]), (*v, outs[2])], B(&s.xr, 0), t, false, g[0], None);
                     let kc = B(&st.kc, idx * self.ctx * kvw * f);
                     let vc = B(&st.vc, idx * self.ctx * kvw * f);
                     cmd.run(
@@ -800,7 +820,7 @@ impl Text {
                         (c.heads, t, 1),
                         (256, 1, 1),
                     );
-                    let ([a0, a1, a2], ln) = self.rot_lora(g[1], 512);
+                    let ([a0, a1, a2], ln) = self.rot_lora(g[1], rpt);
                     cmd.run(
                         "gate_rotate",
                         &[
@@ -814,12 +834,12 @@ impl Text {
                             a2,
                         ],
                         (t, aw.div_ceil(CHUNK) + ln, 1),
-                        (512, 1, 1),
+                        (128, 1, 1),
                     );
-                    self.qmm_lora(cmd, wb, &[(*o, B(&s.h, 0))], B(&s.xr, 0), t, true, g[1]);
+                    self.qmm_lora(cmd, wb, &[(*o, B(&s.h, 0))], B(&s.xr, 0), t, true, g[1], None);
                 }
             }
-            let ([a0, a1, a2], ln) = self.rot_lora(g[2], 512);
+            let ([a0, a1, a2], ln) = self.rot_lora(g[2], rpt);
             cmd.run(
                 "norm_rotate",
                 &[
@@ -835,10 +855,10 @@ impl Text {
                     a2,
                 ],
                 (t, d.div_ceil(CHUNK) + ln, 1),
-                (512, 1, 1),
+                (128, 1, 1),
             );
-            self.qmm_lora(cmd, wb, &[(l.gate, B(&s.a1, 0)), (l.up, B(&s.a2, 0))], B(&s.xr, 0), t, false, g[2]);
-            let ([a0, a1, a2], ln) = self.rot_lora(g[3], 1024);
+            self.qmm_lora(cmd, wb, &[(l.gate, B(&s.a1, 0)), (l.up, B(&s.a2, 0))], B(&s.xr, 0), t, false, g[2], None);
+            let ([a0, a1, a2], ln) = self.rot_lora(g[3], rpt);
             cmd.run(
                 "swiglu_rotate",
                 &[
@@ -852,9 +872,9 @@ impl Text {
                     a2,
                 ],
                 (t, ff.div_ceil(CHUNK) + ln, 1),
-                (1024, 1, 1),
+                (128, 1, 1),
             );
-            self.qmm_lora(cmd, wb, &[(l.down, B(&s.h, 0))], B(&s.xr, 0), t, true, g[3]);
+            self.qmm_lora(cmd, wb, &[(l.down, B(&s.h, 0))], B(&s.xr, 0), t, true, g[3], None);
         }
     }
 
@@ -882,9 +902,9 @@ impl Text {
                 0u32.into(),
             ],
             (n, d.div_ceil(CHUNK), 1),
-            (512, 1, 1),
+            (128, 1, 1),
         );
-        self.qmm_lora(cmd, wb, &[(self.embed, B(&s.logits, 0))], B(&s.xr, 0), n, false, None);
+        self.qmm_lora(cmd, wb, &[(self.embed, B(&s.logits, 0))], B(&s.xr, 0), n, false, None, None);
         cmd.run(
             "argmax1",
             &[
@@ -1061,7 +1081,7 @@ impl Text {
                         0u32.into(),
                     ];
                     if kt > 0 {
-                        args.push(kt.into());
+                        args.extend([kt.into(), B(&self.s.xr, 0).into(), B(&self.s.xr, 0).into(), 0u32.into(), 0u32.into()]);
                     } else {
                         args.extend([B(&self.s.xr, 0).into(), B(&self.s.xr, 0).into(), 0u32.into()]);
                     }
