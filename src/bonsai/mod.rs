@@ -2,8 +2,9 @@
 //! prompt whose state is cached, plus user text, decoded greedily with prompt-lookup speculation and an
 //! optional LoRA adapter.
 //!
-//! Runs on Apple Silicon (macOS 14+) through our own Metal runtime in `runtime/`. Everywhere else
-//! `availability` reports `Unsupported` and `Bonsai::load` fails; the Windows backend comes later.
+//! Runs on Apple Silicon (macOS 14+) through our own Metal runtime in `runtime/`, and on Windows through
+//! libllama and ggml in `ggml/` (Vulkan GPU). Everywhere else `availability` reports `Unsupported` and
+//! `Bonsai::load` fails.
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -12,13 +13,29 @@ use std::time::Duration;
 #[cfg(bonsai_metal)]
 mod metal;
 #[cfg(bonsai_metal)]
+use metal as backend;
+#[cfg(bonsai_metal)]
 #[allow(clippy::all, dead_code, unsafe_op_in_unsafe_fn)]
 #[rustfmt::skip]
 mod runtime;
 
-/// Files a model directory must contain. The runtime also writes `tokenizer.bonsai` (a parsed tokenizer
-/// cache, 6.8 MB) next to them when the directory is writable.
+#[cfg(bonsai_ggml)]
+mod ggml;
+#[cfg(bonsai_ggml)]
+use ggml as backend;
+#[cfg(bonsai_ggml)]
+#[path = "runtime/tokenizer.rs"]
+#[allow(clippy::all, dead_code)]
+#[rustfmt::skip]
+mod tokenizer;
+
+/// Files a model directory must contain: PrismML's MLX 2-bit weights on Metal, its Q2_0 GGUF on Windows,
+/// plus config.json and tokenizer.json from the MLX pack. The runtime also writes `tokenizer.bonsai` (a
+/// parsed tokenizer cache, 6.8 MB) next to them when the directory is writable.
+#[cfg(not(bonsai_ggml))]
 pub const MODEL_FILES: [&str; 3] = ["model.safetensors", "config.json", "tokenizer.json"];
+#[cfg(bonsai_ggml)]
+pub const MODEL_FILES: [&str; 3] = ["model.gguf", "config.json", "tokenizer.json"];
 
 /// Positions in the KV cache: system prompt, user turn and output together.
 pub const CONTEXT: usize = 2048;
@@ -49,7 +66,7 @@ pub struct ModelInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Availability {
     Available,
-    /// Wrong OS, device, or build.
+    /// Wrong OS, device (no Vulkan GPU on Windows), or build.
     Unsupported,
 }
 
@@ -80,7 +97,7 @@ impl std::fmt::Display for BonsaiError {
 impl std::error::Error for BonsaiError {}
 
 impl BonsaiError {
-    #[cfg_attr(not(bonsai_metal), allow(dead_code))]
+    #[cfg_attr(not(bonsai_backend), allow(dead_code))]
     fn new(kind: BonsaiErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
@@ -95,8 +112,9 @@ pub struct GenerateOptions {
     pub max_tokens: usize,
     /// Stop at the end-of-turn token. Off only for benchmarks.
     pub stop_at_eos: bool,
-    /// Prompt-lookup speculation. Output is token for token the same either way; it turns itself off
-    /// within a request when drafts keep failing.
+    /// Prompt-lookup speculation. On Metal the output is token for token the same either way; on Windows
+    /// it can differ where two logits nearly tie. It turns itself off within a request when drafts keep
+    /// failing.
     pub speculate: bool,
 }
 
@@ -143,11 +161,11 @@ pub struct Generation {
 
 /// Whether this build and device can run Bonsai. Cheap after the first call.
 pub fn availability() -> Availability {
-    #[cfg(bonsai_metal)]
+    #[cfg(bonsai_backend)]
     {
-        metal::availability()
+        backend::availability()
     }
-    #[cfg(not(bonsai_metal))]
+    #[cfg(not(bonsai_backend))]
     {
         Availability::Unsupported
     }
@@ -206,27 +224,29 @@ pub fn parse_config(json: &str) -> Result<ModelInfo, BonsaiError> {
 /// A loaded model. Calls are serialized; share it behind an `Arc`.
 pub struct Bonsai {
     info: ModelInfo,
-    #[cfg(bonsai_metal)]
-    inner: metal::Handle,
-    #[cfg(not(bonsai_metal))]
+    #[cfg(bonsai_backend)]
+    inner: backend::Handle,
+    #[cfg(not(bonsai_backend))]
     inner: Never,
 }
 
-#[cfg(not(bonsai_metal))]
+#[cfg(not(bonsai_backend))]
 enum Never {}
 
 impl Bonsai {
-    /// Maps the weights and builds the GPU state (about 25 ms warm). `adapter` is a LoRA safetensors file:
-    /// bonsai/train.py's export, or a PEFT `adapter_model.safetensors` with its `adapter_config.json`
-    /// beside it.
+    /// Maps the weights and builds the GPU state (about 25 ms warm on Metal; about 1.5 s on Windows, which
+    /// uploads the weights). `adapter` is a LoRA safetensors file: bonsai/train.py's export, or a PEFT
+    /// `adapter_model.safetensors` with its `adapter_config.json` beside it. On Windows the first load in a
+    /// process also builds the GPU pipelines: about 0.5 s with the driver's shader cache, about a minute
+    /// the first time on a machine or after a driver update.
     pub fn load(model_dir: &Path, adapter: Option<&Path>) -> Result<Bonsai, BonsaiError> {
         let info = describe(model_dir)?;
-        #[cfg(bonsai_metal)]
+        #[cfg(bonsai_backend)]
         {
-            let inner = metal::Handle::load(model_dir, adapter)?;
+            let inner = backend::Handle::load(model_dir, adapter)?;
             Ok(Bonsai { info, inner })
         }
-        #[cfg(not(bonsai_metal))]
+        #[cfg(not(bonsai_backend))]
         {
             let _ = (info, adapter);
             Err(BonsaiError::new(
@@ -244,11 +264,11 @@ impl Bonsai {
     /// the user text. The three most recent prompts stay cached, also across `release_idle`, and are saved
     /// in the model directory's `prefix-cache` folder for the next load. Blocking.
     pub fn prewarm(&self, system_prompt: &str) -> Result<(), BonsaiError> {
-        #[cfg(bonsai_metal)]
+        #[cfg(bonsai_backend)]
         {
             self.inner.prewarm(system_prompt)
         }
-        #[cfg(not(bonsai_metal))]
+        #[cfg(not(bonsai_backend))]
         {
             let _ = system_prompt;
             match self.inner {}
@@ -264,34 +284,35 @@ impl Bonsai {
         options: &GenerateOptions,
         cancel: Option<&AtomicBool>,
     ) -> Result<Generation, BonsaiError> {
-        #[cfg(bonsai_metal)]
+        #[cfg(bonsai_backend)]
         {
             self.inner
                 .generate(system_prompt, user_text, options, cancel)
         }
-        #[cfg(not(bonsai_metal))]
+        #[cfg(not(bonsai_backend))]
         {
             let _ = (system_prompt, user_text, options, cancel);
             match self.inner {}
         }
     }
 
-    /// Frees the GPU buffers; the weights and the cached system prompt states stay. The next call rebuilds
-    /// the buffers (and rereads the adapter), a few tens of ms. Waits for a running request.
+    /// Frees the GPU buffers; the cached system prompt states stay. On Metal the weights stay mapped and
+    /// the next call rebuilds the buffers (and rereads the adapter) in a few tens of ms. On Windows the
+    /// weights leave GPU memory too and the next call reloads them, about 1 s. Waits for a running request.
     pub fn release_idle(&self) {
-        #[cfg(bonsai_metal)]
+        #[cfg(bonsai_backend)]
         self.inner.release_idle();
-        #[cfg(not(bonsai_metal))]
+        #[cfg(not(bonsai_backend))]
         match self.inner {}
     }
 
     /// Whether `release_idle` freed the GPU state and no call has rebuilt it yet.
     pub fn is_idle(&self) -> bool {
-        #[cfg(bonsai_metal)]
+        #[cfg(bonsai_backend)]
         {
             self.inner.is_idle()
         }
-        #[cfg(not(bonsai_metal))]
+        #[cfg(not(bonsai_backend))]
         match self.inner {}
     }
 }
@@ -342,6 +363,6 @@ mod tests {
     fn describe_requires_all_files() {
         let err = describe(Path::new("/nonexistent")).unwrap_err();
         assert_eq!(err.kind, BonsaiErrorKind::Load);
-        assert!(err.message.contains("model.safetensors"));
+        assert!(err.message.contains(MODEL_FILES[0]));
     }
 }

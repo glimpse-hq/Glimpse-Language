@@ -8,11 +8,14 @@ fn main() {
 
     let apple = macos_arm && feature("APPLE");
     let bonsai_metal = macos_arm && feature("BONSAI");
+    let bonsai_ggml = target_os == "windows" && feature("BONSAI");
 
     // Named cfgs so source files can gate on capabilities instead of
     // repeating feature and target predicates.
     emit_cfg("apple_model", apple);
     emit_cfg("bonsai_metal", bonsai_metal);
+    emit_cfg("bonsai_ggml", bonsai_ggml);
+    emit_cfg("bonsai_backend", bonsai_metal || bonsai_ggml);
 
     if apple {
         println!("cargo::rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
@@ -25,6 +28,77 @@ fn main() {
     if bonsai_metal {
         compile_metal_kernels();
     }
+
+    #[cfg(feature = "bonsai")]
+    if bonsai_ggml {
+        compile_llama();
+    }
+}
+
+/// Builds libllama from vendor/llama.cpp plus our C glue into one static library. ggml itself comes from
+/// transcribe-cpp-sys (vendor/ggml holds its headers), so the process links a single ggml.
+#[cfg(feature = "bonsai")]
+fn compile_llama() {
+    let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let src = root.join("vendor/llama.cpp/src");
+    let glue = root.join("src/bonsai/ggml");
+    for dir in [
+        "vendor/llama.cpp",
+        "vendor/ggml",
+        "src/bonsai/ggml/glue.cpp",
+        "src/bonsai/ggml/compat.cpp",
+        "src/bonsai/ggml/compat.h",
+    ] {
+        println!("cargo::rerun-if-changed={dir}");
+    }
+
+    let cpp_files = |dir: &std::path::Path| -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "cpp"))
+            .collect();
+        files.sort();
+        files
+    };
+    // Model graphs in batches of 16 per translation unit, like llama.cpp's own unity build.
+    let mut units = cpp_files(&src);
+    for (i, batch) in cpp_files(&src.join("models")).chunks(16).enumerate() {
+        let unit = out_dir.join(format!("llama_models_{i}.cpp"));
+        let body: String = batch
+            .iter()
+            .map(|f| {
+                format!(
+                    "#include \"{}\"\n",
+                    f.display().to_string().replace('\\', "/")
+                )
+            })
+            .collect();
+        std::fs::write(&unit, body).unwrap();
+        units.push(unit);
+    }
+    units.push(glue.join("glue.cpp"));
+    units.push(glue.join("compat.cpp"));
+
+    cc::Build::new()
+        .cpp(true)
+        .std("c++17")
+        .files(&units)
+        .include(root.join("vendor/llama.cpp/include"))
+        .include(&src)
+        .include(src.join("models"))
+        .include(root.join("vendor/ggml/include"))
+        .include(&glue)
+        .define("_CRT_SECURE_NO_WARNINGS", None)
+        .flag("/utf-8")
+        .flag("/bigobj")
+        .flag(format!("/FI{}", glue.join("compat.h").display()))
+        // Optimized even in debug builds; an unoptimized libllama decodes several times slower.
+        .opt_level(2)
+        .debug(false)
+        .warnings(false)
+        .compile("bonsai_llama");
 }
 
 fn feature(name: &str) -> bool {
