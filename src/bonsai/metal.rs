@@ -16,6 +16,9 @@ use super::{
     StopReason,
 };
 
+/// Saved system prompt states, inside the model directory.
+const PREFIX_DIR: &str = "prefix-cache";
+
 pub fn availability() -> Availability {
     static AVAILABILITY: OnceLock<Availability> = OnceLock::new();
     *AVAILABILITY.get_or_init(|| {
@@ -183,6 +186,7 @@ impl Handle {
 fn load_model(dir: &Path, adapter: Option<&Path>) -> Result<Model, BonsaiError> {
     guarded(|| {
         let mut model = Model::load(dir, CONTEXT)?;
+        model.prefix_dir = Some(dir.join(PREFIX_DIR));
         if adapter.is_some() {
             model.set_lora(adapter, 1.0)?;
         }

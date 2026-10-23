@@ -208,6 +208,41 @@ impl Policy {
     }
 }
 
+/// Prefix states kept in memory (and files kept in `Model::prefix_dir`): Glimpse's cleanup prompt, Edit Mode
+/// and one writing mode. About 34 MB each on the 2B with a 574-token prompt, 90 MB on the 4B.
+const PREFIX_SLOTS: usize = 3;
+/// Saved prefix file format; bump when the layout or what the state means changes.
+const PREFIX_MAGIC: &[u8; 8] = b"BNSPFX01";
+const FNV: u64 = 0xcbf29ce484222325;
+
+/// State after a prefix (compact: KV sized to the prefix), for one adapter.
+struct Prefix {
+    ids: Vec<u32>,
+    adapter: u64,
+    snap: State,
+}
+
+/// FNV-1a style hash over 8-byte words (fast enough for a 31 MB adapter), then the tail bytes.
+fn hash_bytes(mut h: u64, b: &[u8]) -> u64 {
+    let mut words = b.chunks_exact(8);
+    for w in &mut words {
+        h = (h ^ u64::from_le_bytes(w.try_into().unwrap())).wrapping_mul(0x100000001b3);
+    }
+    for &c in words.remainder() {
+        h = (h ^ c as u64).wrapping_mul(0x100000001b3);
+    }
+    h ^ b.len() as u64
+}
+
+/// Identity of an adapter as loaded: its file, the PEFT config beside it (alpha / r) and the scale. Never 0.
+fn adapter_id(path: &Path, scale: f32) -> Result<u64, String> {
+    let mut h = hash_bytes(FNV, &std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?);
+    if let Ok(cfg) = std::fs::read(path.parent().unwrap_or(Path::new(".")).join("adapter_config.json")) {
+        h = hash_bytes(h, &cfg);
+    }
+    Ok(hash_bytes(h, &scale.to_le_bytes()) | 1)
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Stats {
     pub prompt_tokens: usize,
@@ -231,7 +266,12 @@ pub struct Model {
     pub tok: Tokenizer,
     pub template: Template,
     vision: Option<vision::Vision>,
-    prefix: Option<(Vec<u32>, State, usize, i32)>,
+    /// Cached prefix states, most recently used first.
+    prefixes: Vec<Prefix>,
+    /// Identity of the installed adapter (`adapter_id`), 0 without one.
+    adapter: u64,
+    /// Where prefix states are saved and looked up across processes; None keeps them in memory only.
+    pub prefix_dir: Option<std::path::PathBuf>,
     dir: std::path::PathBuf,
     /// Prompt-lookup speculation for generate() (on by default; draft length chosen per round by `Policy`, up
     /// to `draft_max`; output is token-identical to plain greedy); None decodes one token per step, pipelined.
@@ -272,7 +312,9 @@ impl Model {
             tok,
             template: QWEN35,
             vision: None,
-            prefix: None,
+            prefixes: Vec::new(),
+            adapter: 0,
+            prefix_dir: None,
             dir: dir.to_path_buf(),
             spec: Some(Spec::default()),
             pending: None,
@@ -282,14 +324,15 @@ impl Model {
     }
 
     /// Applies a LoRA adapter (safetensors, see lora.rs) with B scaled by `scale`; None or scale 0 runs the base.
-    /// Drops the cached system prompt state.
+    /// Drops cached prefix states made with a different adapter.
     pub fn set_lora(&mut self, path: Option<&Path>, scale: f32) -> Result<(), String> {
-        let l = match path {
-            Some(p) if scale != 0.0 => Some(lora::load(p, scale, &self.text, &self.gpu)?),
-            _ => None,
+        let (l, id) = match path {
+            Some(p) if scale != 0.0 => (Some(lora::load(p, scale, &self.text, &self.gpu)?), adapter_id(p, scale)?),
+            _ => (None, 0),
         };
         self.text.set_lora(&self.gpu, l);
-        self.prefix = None;
+        self.adapter = id;
+        self.prefixes.retain(|p| p.adapter == id);
         Ok(())
     }
 
@@ -405,39 +448,129 @@ impl Model {
         (0..n as i32).map(|k| [start + k; 3]).collect()
     }
 
-    /// Restores the cached state after `prefix` (token ids), or prefills and caches it. Returns the
-    /// number of tokens served from the cache.
+    /// Restores the cached state after `prefix` (token ids) from memory or `prefix_dir`, or prefills and
+    /// caches it. Returns the number of tokens served from a cache.
     pub fn start_prefix(&mut self, prefix: &[u32]) -> usize {
         self.pending = None;
-        if let Some((k, snap, len, pos)) = &self.prefix {
-            if k.as_slice() == prefix {
-                let mut cmd = self.gpu.begin();
-                self.text
-                    .encode_copy_state(&mut cmd, snap, &self.text.state);
-                cmd.finish();
-                self.text.state.len = *len;
-                self.text.state.pos = *pos;
-                return *len;
-            }
+        if prefix.is_empty() {
+            self.reset();
+            return 0;
+        }
+        let hit = self.prefixes.iter().position(|p| p.ids == prefix && p.adapter == self.adapter);
+        let hit = hit.map(|i| self.prefixes.remove(i)).or_else(|| self.load_prefix(prefix));
+        if let Some(p) = hit {
+            let mut cmd = self.gpu.begin();
+            self.text.encode_copy_state(&mut cmd, &p.snap, &self.text.state);
+            cmd.finish();
+            self.text.state.len = p.snap.len;
+            self.text.state.pos = p.snap.pos;
+            self.prefixes.insert(0, p);
+            return prefix.len();
         }
         self.reset();
-        if !prefix.is_empty() {
-            let pos = Self::text_positions(0, prefix.len());
-            self.prefill(prefix, &pos, &[]);
-        }
-        let mut snap = State::new(&self.gpu, &self.text.cfg, self.text.ctx, self.text.n_gdn, self.text.n_attn);
+        self.prefill(prefix, &Self::text_positions(0, prefix.len()), &[]);
+        let mut snap = self.new_snapshot(self.text.state.len);
         snap.len = self.text.state.len;
+        snap.pos = self.text.state.pos;
         let mut cmd = self.gpu.begin();
-        self.text
-            .encode_copy_state(&mut cmd, &self.text.state, &snap);
+        self.text.encode_copy_state(&mut cmd, &self.text.state, &snap);
         cmd.finish();
-        self.prefix = Some((
-            prefix.to_vec(),
-            snap,
-            self.text.state.len,
-            self.text.state.pos,
-        ));
+        let p = Prefix { ids: prefix.to_vec(), adapter: self.adapter, snap };
+        self.save_prefix(&p);
+        self.prefixes.insert(0, p);
+        self.prefixes.truncate(PREFIX_SLOTS);
         0
+    }
+
+    /// A state sized for `len` positions.
+    fn new_snapshot(&self, len: usize) -> State {
+        State::new(&self.gpu, &self.text.cfg, len, self.text.n_gdn, self.text.n_attn)
+    }
+
+    /// Everything a saved prefix state depends on besides its token ids: format, kernels, executable, GPU,
+    /// model files and adapter. None when a part cannot be read (nothing is saved or loaded then).
+    fn prefix_identity(&self) -> Option<Vec<u8>> {
+        let stamp = |p: &Path| -> Option<[u64; 2]> {
+            let m = std::fs::metadata(p).ok()?;
+            let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+            Some([m.len(), t.as_nanos() as u64])
+        };
+        let mut id = PREFIX_MAGIC.to_vec();
+        let mut words = vec![hash_bytes(FNV, gpu::METALLIB), self.adapter];
+        words.extend(stamp(&std::env::current_exe().ok()?)?);
+        words.extend(stamp(&self.dir.join("model.safetensors"))?);
+        words.push(hash_bytes(FNV, &std::fs::read(self.dir.join("config.json")).ok()?));
+        let c = &self.text.cfg;
+        words.extend([self.text.n_gdn, self.text.n_attn, c.hidden, c.kv_width(), c.conv_dim()].map(|v| v as u64));
+        id.extend(words.iter().flat_map(|w| w.to_le_bytes()));
+        id.extend(objc2_metal::MTLDevice::name(&*self.gpu.device).to_string().bytes());
+        Some(id)
+    }
+
+    fn prefix_path(&self, identity: &[u8], ids: &[u32]) -> Option<std::path::PathBuf> {
+        let h = hash_bytes(hash_bytes(FNV, identity), &ids.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>());
+        Some(self.prefix_dir.as_ref()?.join(format!("{h:016x}.prefix")))
+    }
+
+    /// Reads a saved state for `ids` made by this exact model, adapter, executable and GPU, if there is one.
+    fn load_prefix(&self, ids: &[u32]) -> Option<Prefix> {
+        use std::io::Read;
+        self.prefix_dir.as_ref()?;
+        let identity = self.prefix_identity()?;
+        let mut f = std::fs::File::open(self.prefix_path(&identity, ids)?).ok()?;
+        let mut head = vec![0u8; identity.len() + 4 * ids.len() + 16];
+        f.read_exact(&mut head).ok()?;
+        let want: Vec<u8> = identity.iter().copied().chain(ids.iter().flat_map(|t| t.to_le_bytes())).collect();
+        if head[..want.len()] != want[..] {
+            return None;
+        }
+        let len = u64::from_le_bytes(head[want.len()..want.len() + 8].try_into().ok()?) as usize;
+        let pos = i64::from_le_bytes(head[want.len() + 8..].try_into().ok()?) as i32;
+        if len != ids.len() {
+            return None;
+        }
+        let mut snap = self.new_snapshot(len);
+        for part in self.text.state_bytes(&snap) {
+            f.read_exact(part).ok()?;
+        }
+        if f.read(&mut [0u8]).ok()? != 0 {
+            return None;
+        }
+        (snap.len, snap.pos) = (len, pos);
+        Some(Prefix { ids: ids.to_vec(), adapter: self.adapter, snap })
+    }
+
+    /// Writes `p` to `prefix_dir` on a background thread (temporary file, then rename) and keeps the newest
+    /// PREFIX_SLOTS files there.
+    fn save_prefix(&self, p: &Prefix) {
+        let Some(identity) = self.prefix_identity() else { return };
+        let (Some(dir), Some(path)) = (self.prefix_dir.clone(), self.prefix_path(&identity, &p.ids)) else { return };
+        let mut data = identity;
+        data.extend(p.ids.iter().flat_map(|t| t.to_le_bytes()));
+        data.extend((p.snap.len as u64).to_le_bytes());
+        data.extend((p.snap.pos as i64).to_le_bytes());
+        for part in self.text.state_bytes(&p.snap) {
+            data.extend_from_slice(part);
+        }
+        std::thread::spawn(move || {
+            let tmp = path.with_extension("tmp");
+            if std::fs::create_dir_all(&dir).is_err() || std::fs::write(&tmp, &data).is_err() || std::fs::rename(&tmp, &path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                return;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else { return };
+            let mut files: Vec<_> = entries
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    let name = e.file_name();
+                    name.to_str()?.ends_with(".prefix").then(|| Some((e.metadata().ok()?.modified().ok()?, e.path())))?
+                })
+                .collect();
+            files.sort_by(|a, b| b.0.cmp(&a.0));
+            for (_, old) in files.into_iter().skip(PREFIX_SLOTS) {
+                let _ = std::fs::remove_file(old);
+            }
+        });
     }
 
     fn start(&mut self, system: Option<&str>) -> usize {
@@ -452,8 +585,9 @@ impl Model {
         self.start_prefix(&ids)
     }
 
+    /// Drops the prefix states held in memory (saved files stay).
     pub fn clear_prefix_cache(&mut self) {
-        self.prefix = None;
+        self.prefixes.clear();
     }
 
     /// System prompt + user input (+ image) -> greedy output, streamed through `emit`.

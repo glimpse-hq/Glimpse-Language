@@ -12,7 +12,7 @@ pub type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 type Encoder = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
 type CmdBuf = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
 
-static METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.metallib"));
+pub static METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.metallib"));
 
 pub struct Gpu {
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,

@@ -240,8 +240,9 @@ impl Bonsai {
         &self.info
     }
 
-    /// Prefills `system_prompt` and caches its state, so the next `generate` with the same prompt only
-    /// prefills the user text. One prompt is cached at a time. Blocking.
+    /// Prefills `system_prompt` and caches its state, so a `generate` with the same prompt only prefills
+    /// the user text. The three most recent prompts stay cached, also across `release_idle`, and are saved
+    /// in the model directory's `prefix-cache` folder for the next load. Blocking.
     pub fn prewarm(&self, system_prompt: &str) -> Result<(), BonsaiError> {
         #[cfg(bonsai_metal)]
         {
@@ -275,8 +276,8 @@ impl Bonsai {
         }
     }
 
-    /// Frees the GPU buffers and the cached system prompt state; the weights stay mapped. The next call
-    /// rebuilds them (and rereads the adapter), a few tens of ms. Waits for a running request.
+    /// Frees the GPU buffers; the weights and the cached system prompt states stay. The next call rebuilds
+    /// the buffers (and rereads the adapter), a few tens of ms. Waits for a running request.
     pub fn release_idle(&self) {
         #[cfg(bonsai_metal)]
         self.inner.release_idle();

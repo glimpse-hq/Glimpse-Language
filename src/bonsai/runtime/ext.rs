@@ -4,7 +4,7 @@ use super::gpu::Gpu;
 use super::model::{Config, Text, VMAX};
 use super::tokenizer::Tokenizer;
 use super::weights::Weights;
-use super::{Model, QWEN35, Spec, Stats, Template};
+use super::{Model, Prefix, QWEN35, Spec, Stats, Template};
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,7 +44,7 @@ pub(crate) fn user_turn(t: &Template, user: &str) -> String {
     format!("{}{}{}{}", t.user.0, user.trim(), t.user.1, t.assistant)
 }
 
-/// What stays when idle: device and pipelines, mapped weights, tokenizer.
+/// What stays when idle: device and pipelines, mapped weights, tokenizer, cached prefix states.
 pub(crate) struct Idle {
     gpu: Gpu,
     w: Weights,
@@ -53,6 +53,9 @@ pub(crate) struct Idle {
     ctx: usize,
     dir: PathBuf,
     spec: Option<Spec>,
+    prefixes: Vec<Prefix>,
+    adapter: u64,
+    prefix_dir: Option<PathBuf>,
 }
 
 pub(crate) enum RunError {
@@ -69,7 +72,8 @@ pub(crate) struct Run {
 }
 
 impl Model {
-    /// Drops the GPU buffers (scratch, KV cache, recurrent state, prefix snapshot, vision).
+    /// Drops the GPU buffers (scratch, KV cache, recurrent state, adapter, vision). Prefix states stay;
+    /// they are kept on wake when the same adapter is set again.
     pub(crate) fn into_idle(self) -> Idle {
         let cfg = self.text.cfg.clone();
         let ctx = self.text.ctx;
@@ -79,6 +83,9 @@ impl Model {
             tok,
             dir,
             spec,
+            prefixes,
+            adapter,
+            prefix_dir,
             ..
         } = self;
         Idle {
@@ -89,6 +96,9 @@ impl Model {
             ctx,
             dir,
             spec,
+            prefixes,
+            adapter,
+            prefix_dir,
         }
     }
 
@@ -172,7 +182,9 @@ impl Idle {
             tok: self.tok,
             template: QWEN35,
             vision: None,
-            prefix: None,
+            prefixes: self.prefixes,
+            adapter: self.adapter,
+            prefix_dir: self.prefix_dir,
             dir: self.dir,
             spec: self.spec,
             ignore_eos: false,

@@ -177,6 +177,8 @@ pub struct State {
     conv: Buffer,
     kc: Buffer,
     vc: Buffer,
+    /// KV positions per attention layer (ctx for the live state, the prefix length for a snapshot).
+    pub cap: usize,
     /// Tokens in the KV cache.
     pub len: usize,
     /// Next mrope position (differs from len after an image).
@@ -257,6 +259,7 @@ impl State {
             conv: gpu.buffer(n_gdn * cfg.conv_state() * 4),
             kc: gpu.buffer(n_attn * ctx * cfg.kv_width() * 4),
             vc: gpu.buffer(n_attn * ctx * cfg.kv_width() * 4),
+            cap: ctx,
             len: 0,
             pos: 0,
         }
@@ -1012,19 +1015,33 @@ impl Text {
 
     /// GPU copy of the whole state (used length of the KV cache only).
     pub fn encode_copy_state(&self, cmd: &mut Cmd, from: &State, to: &State) {
+        assert!(from.len <= to.cap);
         let f = 4usize;
         let c = &self.cfg;
         cmd.copy(B(&from.gdn, 0), B(&to.gdn, 0), self.n_gdn * c.gdn_state() * f);
         cmd.copy(B(&from.conv, 0), B(&to.conv, 0), self.n_gdn * c.conv_state() * f);
         let kvw = c.kv_width();
         for i in 0..self.n_attn {
-            let o = i * self.ctx * kvw * f;
             let n = from.len * kvw * f;
             if n > 0 {
-                cmd.copy(B(&from.kc, o), B(&to.kc, o), n);
-                cmd.copy(B(&from.vc, o), B(&to.vc, o), n);
+                cmd.copy(B(&from.kc, i * from.cap * kvw * f), B(&to.kc, i * to.cap * kvw * f), n);
+                cmd.copy(B(&from.vc, i * from.cap * kvw * f), B(&to.vc, i * to.cap * kvw * f), n);
             }
         }
+    }
+
+    /// Host views of a snapshot's buffers (GDN state, conv state, K, V), for saving and loading it.
+    /// Only valid while no GPU work writes `s`.
+    pub fn state_bytes<'a>(&self, s: &'a State) -> [&'a mut [u8]; 4] {
+        let c = &self.cfg;
+        let kv = self.n_attn * s.cap * c.kv_width() * 4;
+        let part = |b: &Buffer, n: usize| unsafe { std::slice::from_raw_parts_mut(contents::<u8>(b), n) };
+        [
+            part(&s.gdn, self.n_gdn * c.gdn_state() * 4),
+            part(&s.conv, self.n_gdn * c.conv_state() * 4),
+            part(&s.kc, kv),
+            part(&s.vc, kv),
+        ]
     }
 }
 
