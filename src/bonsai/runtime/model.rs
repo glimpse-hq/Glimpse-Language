@@ -479,37 +479,89 @@ impl Text {
             ];
             return cmd.run("qmv4", &args, (l.o / 8, 1, 1), (64, 1, 1));
         }
-        // T >= 4: the LoRA up projection is added in each matmul's store (u rows of R floats, member i at i * r);
-        // T = 2, 3: by one lora_b pass after the group (qmvr's loop slows down with it inside)
-        let post = t > 3;
-        for (i, (l, y)) in ls.iter().enumerate() {
-            let lora = group.filter(|_| post).map(|(g, st)| (B(&st.lora.buf, g.b[i]), B(&st.u, i * g.r * 4), g.r, g.rows()));
-            self.qmm(cmd, wb, *l, x, *y, t, add, lora);
+        // Metal: fused shared-input kernels; Vulkan keeps per-matrix dispatches (gpu_vk maps them to qmm_cm)
+        #[cfg(target_os = "macos")]
+        {
+            // T = 2, 3: qmvr (decode math per row); verify batches: qmvxm, 8 rows per pass; prefill: qmm tiles
+            let (kernel, step) = match t {
+                2 | 3 => ("qmvr", t),
+                4..=16 => ("qmvxm", 8),
+                _ => ("qmm", t),
+            };
+            for c in (0..t).step_by(step) {
+                self.qmm_fused(kernel, cmd, wb, ls, x, c, (t - c).min(step), add, group);
+            }
         }
-        if let Some((g, st)) = group.filter(|_| !post) {
-            let lb = &st.lora.buf;
-            let mut args: Vec<Arg> = Vec::with_capacity(12);
-            let mut os = [0u32; 3];
-            for i in 0..3 {
-                let j = i.min(ls.len() - 1);
-                args.push(B(lb, g.b[j]).into());
-                args.push(ls[j].1.into());
-                if i < ls.len() {
-                    os[i] = ls[i].0.o as u32;
+        #[cfg(not(target_os = "macos"))]
+        {
+            // T >= 4: the LoRA up projection is added in each matmul's store (u rows of R floats, member i at i * r);
+            // T = 2, 3: by one lora_b pass after the group (qmvr's loop slows down with it inside)
+            let post = t > 3;
+            for (i, (l, y)) in ls.iter().enumerate() {
+                let lora = group.filter(|_| post).map(|(g, st)| (B(&st.lora.buf, g.b[i]), B(&st.u, i * g.r * 4), g.r, g.rows()));
+                self.qmm(cmd, wb, *l, x, *y, t, add, lora);
+            }
+            if let Some((g, st)) = group.filter(|_| !post) {
+                let lb = &st.lora.buf;
+                let mut args: Vec<Arg> = Vec::with_capacity(12);
+                let mut os = [0u32; 3];
+                for i in 0..3 {
+                    let j = i.min(ls.len() - 1);
+                    args.push(B(lb, g.b[j]).into());
+                    args.push(ls[j].1.into());
+                    if i < ls.len() {
+                        os[i] = ls[i].0.o as u32;
+                    }
                 }
+                args.push(B(&st.u, 0).into());
+                for o in os {
+                    args.push(o.into());
+                }
+                args.push((g.r as u32).into());
+                args.push((g.rows() as u32).into());
+                let total: u32 = os.iter().sum();
+                cmd.run("lora_b", &args, ((total as usize).div_ceil(256), t, 1), (256, 1, 1));
             }
-            args.push(B(&st.u, 0).into());
-            for o in os {
-                args.push(o.into());
+        }
+    }
+
+    /// Rows [c, c + t) of matmuls sharing input `x` in one dispatch of `kernel` (qmvr, qmvxm or qmm), with the LoRA
+    /// up projection of `group` in the store.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    fn qmm_fused(&self, kernel: &str, cmd: &mut Cmd, wb: &Buffer, ls: &[(Lin, B)], x: B, c: usize, t: usize, add: bool, group: Option<(&Group, &LoraState)>) {
+        let mut args: Vec<Arg> = Vec::with_capacity(22);
+        for i in 0..3 {
+            let (l, y) = ls[i.min(ls.len() - 1)];
+            args.extend([B(wb, l.w).into(), B(wb, l.s).into(), B(y.0, y.1 + c * l.o * 4).into()]);
+        }
+        let o = |i: usize| if i < ls.len() { ls[i].0.o } else { 0 };
+        let total: usize = ls.iter().map(|(l, _)| l.o).sum();
+        args.extend([B(x.0, x.1 + c * ls[0].0.k * 4).into(), (ls[0].0.k as u32).into(), (o(0) as u32).into(), (o(1) as u32).into()]);
+        args.extend([(total as u32).into(), (add as u32).into(), (t as u32).into()]);
+        match group {
+            Some((g, st)) => {
+                for i in 0..3 {
+                    args.push(B(&st.lora.buf, g.b[i.min(g.b.len() - 1)]).into());
+                }
+                args.extend([B(&st.u, c * g.rows() * 4).into(), (g.r as u32).into(), (g.rows() as u32).into()]);
             }
-            args.push((g.r as u32).into());
-            args.push((g.rows() as u32).into());
-            let total: u32 = os.iter().sum();
-            cmd.run("lora_b", &args, ((total as usize).div_ceil(256), t, 1), (256, 1, 1));
+            None => {
+                for _ in 0..4 {
+                    args.push(B(&self.s.xr, 0).into());
+                }
+                args.extend([0u32.into(), 0u32.into()]);
+            }
+        }
+        match kernel {
+            "qmvr" => cmd.run(kernel, &args, (total / 8, 1, 1), (64 * t, 1, 1)),
+            "qmvxm" => cmd.run(kernel, &args, (total / 32, 1, 1), (128, 1, 1)),
+            _ => cmd.run(kernel, &args, (total / 64, t.div_ceil(32), 1), (64, 1, 1)),
         }
     }
 
     /// T > 1 matmul y (+)= x W^T, plus the LoRA up projection (B, u, r, row stride of u) in the store.
+    #[cfg(not(target_os = "macos"))]
     #[allow(clippy::too_many_arguments)]
     fn qmm(&self, cmd: &mut Cmd, wb: &Buffer, l: Lin, x: B, y: B, t: usize, add: bool, lora: Option<(B, B, usize, usize)>) {
         assert!(t > 1, "t == 1 goes through qmm_lora");
