@@ -1,0 +1,26 @@
+#version 460
+#include "common.glsl"
+// Attention output gate then rotate: x[e] = attn[e] * sigmoid(gate), gate from the q_proj output (per head 256 q,
+// 256 gate). W = heads * 256.
+layout(local_size_x = 128) in;
+layout(push_constant) uniform P { PTR attn; PTR qp; PTR signs; PTR xr; uint W; PTR A; PTR U; uint R; } pc;
+shared float red[16];
+shared float lred[16];
+#include "rot.glsl"
+
+void main() {
+    uint W = pc.W, K = W, t = gl_WorkGroupID.x, nch = (W + CHUNK - 1u) / CHUNK;
+    uint ao = t * W, qo = t * 2u * W;
+    LORA_ROW(nch, f4(pc.attn, ao + k) * sigmoid4(f4(pc.qp, qo + (k >> 8) * 512u + 256u + (k & 255u))))
+    uint c0 = gl_WorkGroupID.y * CHUNK + SID * 512u + LANE;
+    if (c0 >= W) return;
+    float v[16];
+    [[unroll]] for (uint i = 0u; i < 16u; i++) {
+        uint e = c0 + 32u * i, hd = e >> 8, d = e & 255u;
+        float gt = Fp(pc.qp).v[qo + hd * 512u + 256u + d];
+        float a = Fp(pc.attn).v[ao + e];
+        v[i] = (a * (1.0 / (1.0 + exp(-gt)))) * Fp(pc.signs).v[e];
+    }
+    fwht512(v);
+    [[unroll]] for (uint i = 0u; i < 16u; i++) Fp(pc.xr).v[ao + c0 + 32u * i] = v[i] * INV_SQRT512;
+}

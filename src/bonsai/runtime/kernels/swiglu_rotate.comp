@@ -1,0 +1,24 @@
+#version 460
+#include "common.glsl"
+// xr = fwht(signs * silu(g) * u) (MLP down input).
+layout(local_size_x = 128) in;
+layout(push_constant) uniform P { PTR g; PTR u; PTR signs; PTR xr; uint D; PTR A; PTR U; uint R; } pc;
+shared float red[16];
+shared float lred[16];
+#include "rot.glsl"
+
+void main() {
+    uint D = pc.D, K = D, t = gl_WorkGroupID.x, nch = (D + CHUNK - 1u) / CHUNK;
+    uint xo = t * D;
+    LORA_ROW(nch, silu4(f4(pc.g, xo + k)) * f4(pc.u, xo + k))
+    uint c0 = gl_WorkGroupID.y * CHUNK + SID * 512u + LANE;
+    if (c0 >= D) return;
+    float v[16];
+    [[unroll]] for (uint i = 0u; i < 16u; i++) {
+        uint e = c0 + 32u * i;
+        float a = Fp(pc.g).v[xo + e];
+        v[i] = ((a * Fp(pc.u).v[xo + e]) * (1.0 / (1.0 + exp(-a)))) * Fp(pc.signs).v[e];
+    }
+    fwht512(v);
+    [[unroll]] for (uint i = 0u; i < 16u; i++) Fp(pc.xr).v[xo + c0 + 32u * i] = v[i] * INV_SQRT512;
+}

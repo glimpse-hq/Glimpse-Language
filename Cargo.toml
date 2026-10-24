@@ -14,13 +14,14 @@ documentation = "https://docs.rs/glimpse-language"
 [features]
 default = []
 apple = ["dep:serde"]
-bonsai = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal", "dep:dispatch2", "dep:libc", "dep:half", "dep:regex", "dep:image", "dep:transcribe-cpp-sys", "dep:cc"]
+bonsai = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal", "dep:dispatch2", "dep:libc", "dep:half", "dep:regex", "dep:image", "dep:ash"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = "1"
 half = { version = "2", default-features = false, optional = true }
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 
 # The Bonsai Metal runtime. Only built on Apple Silicon.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
@@ -29,15 +30,10 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLDevice", "MTLBuffer", "MTLResource", "MTLAllocation", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLLibrary", "MTLTypes", "MTLBlitCommandEncoder", "block2", "dispatch2"], optional = true }
 dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2", "block2"], optional = true }
 libc = { version = "0.2", optional = true }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 
-# The Bonsai ggml backend on Windows: libllama (vendor/llama.cpp) built against transcribe.cpp's ggml, so the
-# process has one ggml. Keep the rev equal to Glimpse-Speech's transcribe-cpp pin.
+# The Bonsai Vulkan backend (Windows): kernels precompiled to SPIR-V at build time, Vulkan loaded at run time.
 [target.'cfg(windows)'.dependencies]
-transcribe-cpp-sys = { git = "https://github.com/glimpse-hq/transcribe.cpp.git", rev = "95e3eff8b2b58361b51d96a4f2077ed770aee9f0", default-features = false, features = ["vulkan"], optional = true }
-
-[build-dependencies]
-cc = { version = "1", features = ["parallel"], optional = true }
+ash = { version = "0.38", optional = true }
 
 [profile.release]
 lto = "thin"

@@ -1,0 +1,29 @@
+#version 460
+#include "common.glsl"
+// Causal depthwise conv (kernel 4) over [state (3 rows), qkv (T rows)], silu, then q/k rmsnorm per head.
+// Grid (T, C / 128). Output q * 1/128, k * 1/sqrt(128), v. update: shift this channel's conv state (T = 1).
+layout(local_size_x = 128) in;
+layout(push_constant) uniform P { PTR qkv; PTR cstate; PTR cw; PTR out_; uint update; uint C; uint NK; } pc;
+shared float red[32];
+void main() {
+    uint t = gl_WorkGroupID.x, grp = gl_WorkGroupID.y, C = pc.C;
+    uint c = grp * 128u + gl_LocalInvocationIndex;
+    float acc = 0.0;
+    float rows[4];
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        uint j = t + i;
+        rows[i] = j < 3u ? Fp(pc.cstate).v[j * C + c] : Fp(pc.qkv).v[(j - 3u) * C + c];
+        acc += Fp(pc.cw).v[c * 4u + i] * rows[i];
+    }
+    if (pc.update != 0u)
+        [[unroll]] for (uint i = 0u; i < 3u; i++) Fp(pc.cstate).v[i * C + c] = rows[i + 1u];
+    float v = acc / (1.0 + exp(-acc));
+    if (grp < 2u * pc.NK) {
+        float s = subgroupAdd(v * v);
+        if (LANE == 0u) red[SID] = s;
+        barrier();
+        float r = inversesqrt(subgroupAdd(LANE < 4u ? red[LANE] : 0.0) / 128.0 + EPS);
+        v = v * r * (grp < pc.NK ? (1.0 / 128.0) : 0.08838834764831845);
+    }
+    Fp(pc.out_).v[t * C + c] = v;
+}

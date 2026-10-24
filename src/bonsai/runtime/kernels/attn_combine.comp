@@ -1,0 +1,21 @@
+#version 460
+#include "common.glsl"
+// Combine split partials: out[t, h * 256 + d]. Grid (H, T).
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P { PTR part; PTR out_; uint nsplit_; uint H; uint threads; PTR dyn; } pc;
+void main() {
+    uint h = gl_WorkGroupID.x, t = gl_WorkGroupID.y, d = gl_LocalInvocationIndex;
+    uint ns = pc.dyn != uvec2(0u) ? Up(pc.dyn).v[1] : pc.nsplit_;
+    uint p = (t * pc.H + h) * ns * 258u;
+    float M = NEG_INF;
+    for (uint s = 0u; s < ns; s++) M = max(M, Fp(pc.part).v[p + s * 258u]);
+    float L = 0.0, a = 0.0;
+    for (uint s = 0u; s < ns; s++) {
+        float m = Fp(pc.part).v[p + s * 258u];
+        if (m == NEG_INF) continue;
+        float w = exp(m - M);
+        L += Fp(pc.part).v[p + s * 258u + 1u] * w;
+        a += Fp(pc.part).v[p + s * 258u + 2u + d] * w;
+    }
+    Fp(pc.out_).v[t * pc.H * 256u + h * 256u + d] = a / L;
+}

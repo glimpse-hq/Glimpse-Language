@@ -1,0 +1,12 @@
+#version 460
+#include "common.glsl"
+// Sums split-K partials of qmm_cm: Y[t, n] = (add ? Y : 0) + sum over slices of part[s][t][n]. Grid ceil(T O / 256).
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P { PTR part; PTR Y; uint T; uint O; uint split; uint add; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x, n = pc.T * pc.O;
+    if (i >= n) return;
+    float v = 0.0;
+    for (uint s = 0u; s < pc.split; s++) v += Fp(pc.part).v[s * n + i];
+    Fp(pc.Y).v[i] = pc.add != 0u ? Fp(pc.Y).v[i] + v : v;
+}

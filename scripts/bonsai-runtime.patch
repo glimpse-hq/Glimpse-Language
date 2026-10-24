@@ -1,6 +1,6 @@
 --- a/src/bonsai/runtime/mod.rs
 +++ b/src/bonsai/runtime/mod.rs
-@@ -8,6 +8,7 @@
+@@ -12,6 +12,7 @@
  pub mod tokenizer;
  pub mod vision;
  pub mod weights;
@@ -8,7 +8,7 @@
  
  use gpu::Gpu;
  use model::{State, Text, TMAX};
-@@ -797,6 +798,9 @@
+@@ -799,6 +800,9 @@
          // realized tokens and table cost of recent verify rounds (decayed like the policy's counts)
          let (mut got, mut spent, mut rounds) = (0.0, 0.0, 0);
          while out.len() < max_tokens {
@@ -18,7 +18,7 @@
              let last = *seq.last().unwrap();
              let left = max_tokens - out.len();
              if rounds >= GIVE_UP_ROUNDS && got < KEEP_GAIN * spent {
-@@ -909,6 +913,10 @@
+@@ -911,6 +915,10 @@
          self.text.encode_step(&mut cmd, &self.w.buf, k);
          let mut prev = cmd.commit();
          while out.len() < max_tokens {

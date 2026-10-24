@@ -2,40 +2,23 @@
 //! prompt whose state is cached, plus user text, decoded greedily with prompt-lookup speculation and an
 //! optional LoRA adapter.
 //!
-//! Runs on Apple Silicon (macOS 14+) through our own Metal runtime in `runtime/`, and on Windows through
-//! libllama and ggml in `ggml/` (Vulkan GPU). Everywhere else `availability` reports `Unsupported` and
-//! `Bonsai::load` fails.
+//! Runs through our own runtime in `runtime/`: Metal kernels on Apple Silicon (macOS 14+), Vulkan kernels on
+//! Windows. Everywhere else `availability` reports `Unsupported` and `Bonsai::load` fails.
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-#[cfg(bonsai_metal)]
-mod metal;
-#[cfg(bonsai_metal)]
-use metal as backend;
-#[cfg(bonsai_metal)]
+#[cfg(bonsai_backend)]
+mod handle;
+#[cfg(bonsai_backend)]
 #[allow(clippy::all, dead_code, unsafe_op_in_unsafe_fn)]
 #[rustfmt::skip]
 mod runtime;
 
-#[cfg(bonsai_ggml)]
-mod ggml;
-#[cfg(bonsai_ggml)]
-use ggml as backend;
-#[cfg(bonsai_ggml)]
-#[path = "runtime/tokenizer.rs"]
-#[allow(clippy::all, dead_code)]
-#[rustfmt::skip]
-mod tokenizer;
-
-/// Files a model directory must contain: PrismML's MLX 2-bit weights on Metal, its Q2_0 GGUF on Windows,
-/// plus config.json and tokenizer.json from the MLX pack. The runtime also writes `tokenizer.bonsai` (a
-/// parsed tokenizer cache, 6.8 MB) next to them when the directory is writable.
-#[cfg(not(bonsai_ggml))]
+/// Files a model directory must contain, the same on macOS and Windows: PrismML's MLX 2-bit pack. The runtime
+/// also writes `tokenizer.bonsai` (a parsed tokenizer cache, 6.8 MB) next to them when the directory is writable.
 pub const MODEL_FILES: [&str; 3] = ["model.safetensors", "config.json", "tokenizer.json"];
-#[cfg(bonsai_ggml)]
-pub const MODEL_FILES: [&str; 3] = ["model.gguf", "config.json", "tokenizer.json"];
 
 /// Positions in the KV cache: system prompt, user turn and output together.
 pub const CONTEXT: usize = 2048;
@@ -66,7 +49,7 @@ pub struct ModelInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Availability {
     Available,
-    /// Wrong OS, device (no Vulkan GPU on Windows), or build.
+    /// Wrong OS, device (no suitable Vulkan GPU on Windows), or build.
     Unsupported,
 }
 
@@ -163,7 +146,7 @@ pub struct Generation {
 pub fn availability() -> Availability {
     #[cfg(bonsai_backend)]
     {
-        backend::availability()
+        handle::availability()
     }
     #[cfg(not(bonsai_backend))]
     {
@@ -225,7 +208,7 @@ pub fn parse_config(json: &str) -> Result<ModelInfo, BonsaiError> {
 pub struct Bonsai {
     info: ModelInfo,
     #[cfg(bonsai_backend)]
-    inner: backend::Handle,
+    inner: handle::Handle,
     #[cfg(not(bonsai_backend))]
     inner: Never,
 }
@@ -234,16 +217,15 @@ pub struct Bonsai {
 enum Never {}
 
 impl Bonsai {
-    /// Maps the weights and builds the GPU state (about 25 ms warm on Metal; about 1.5 s on Windows, which
-    /// uploads the weights). `adapter` is a LoRA safetensors file: bonsai/train.py's export, or a PEFT
-    /// `adapter_model.safetensors` with its `adapter_config.json` beside it. On Windows the first load in a
-    /// process also builds the GPU pipelines: about 0.5 s with the driver's shader cache, about a minute
-    /// the first time on a machine or after a driver update.
+    /// Maps (Metal, about 25 ms warm) or uploads (Vulkan, 0.4 to 1 s warm) the weights and builds the GPU
+    /// state. `adapter` is a LoRA safetensors file: bonsai/train.py's export, or a PEFT
+    /// `adapter_model.safetensors` with its `adapter_config.json` beside it. On Vulkan the first load on a
+    /// machine (or after a driver update) also builds the GPU pipelines, about 2 s more.
     pub fn load(model_dir: &Path, adapter: Option<&Path>) -> Result<Bonsai, BonsaiError> {
         let info = describe(model_dir)?;
         #[cfg(bonsai_backend)]
         {
-            let inner = backend::Handle::load(model_dir, adapter)?;
+            let inner = handle::Handle::load(model_dir, adapter)?;
             Ok(Bonsai { info, inner })
         }
         #[cfg(not(bonsai_backend))]
@@ -296,9 +278,8 @@ impl Bonsai {
         }
     }
 
-    /// Frees the GPU buffers; the cached system prompt states stay. On Metal the weights stay mapped and
-    /// the next call rebuilds the buffers (and rereads the adapter) in a few tens of ms. On Windows the
-    /// weights leave GPU memory too and the next call reloads them, about 1 s. Waits for a running request.
+    /// Frees the GPU buffers; the weights and the cached system prompt states stay. The next call rebuilds
+    /// the buffers (and rereads the adapter), a few tens of ms. Waits for a running request.
     pub fn release_idle(&self) {
         #[cfg(bonsai_backend)]
         self.inner.release_idle();

@@ -1,7 +1,7 @@
 //! Qwen3.5 hybrid text model (Gated DeltaNet + gated attention layers) encoded as Metal dispatches.
 //! All sizes come from config.json (Ternary Bonsai 2 2B and 4B).
 
-use super::gpu::{contents, Arg, Buffer, Cmd, Gpu, B};
+use super::gpu::{self, contents, Arg, Buffer, Cmd, Gpu, B};
 use super::lora::{Group, Lora};
 use super::weights::Weights;
 
@@ -315,12 +315,14 @@ impl Text {
             .collect();
         let half = cfg.rotary_dims / 2;
         let inv_freq = gpu.buffer(half * 4);
-        let f = contents::<f32>(&inv_freq);
-        for i in 0..half {
-            unsafe { *f.add(i) = 1.0 / (cfg.rope_theta as f32).powf((2 * i) as f32 / cfg.rotary_dims as f32) };
-        }
+        let freqs: Vec<u8> = (0..half)
+            .flat_map(|i| (1.0 / (cfg.rope_theta as f32).powf((2 * i) as f32 / cfg.rotary_dims as f32)).to_le_bytes())
+            .collect();
+        gpu::write(&inv_freq, 0, &freqs);
         let logit_rows = VMAX;
         let f4 = |n: usize| gpu.buffer(n * 4);
+        // buffers the host reads or writes every step
+        let io = |n: usize| gpu.io_buffer(n * 4);
         let wide = ff.max(d).max(gw).max(aw);
         let s = Scratch {
             h: f4(TMAX * d),
@@ -334,15 +336,15 @@ impl Text {
             kp: f4(TMAX * kvw),
             vp: f4(TMAX * kvw),
             q: f4(TMAX * aw),
-            ids: f4(TMAX),
-            pos: f4(3 * TMAX),
+            ids: io(TMAX),
+            pos: io(3 * TMAX),
             logits: f4(logit_rows * cfg.vocab),
             pv: f4(logit_rows * ARGMAX_GROUPS),
             apart: f4(TMAX * cfg.heads * MAX_SPLITS * 258),
             pi: f4(logit_rows * ARGMAX_GROUPS),
-            out: f4(logit_rows),
-            dtok: f4(2),
-            dpos: f4(6),
+            out: io(logit_rows),
+            dtok: io(2),
+            dpos: io(6),
             v_qkv: f4(ng * VMAX * conv),
             v_qkvc: f4(ng * VMAX * conv),
             v_ab: f4(ng * VMAX * 2 * cfg.lin_v_heads),
@@ -402,10 +404,8 @@ impl Text {
     pub fn reset(&mut self) {
         self.state.len = 0;
         self.state.pos = 0;
-        unsafe {
-            std::ptr::write_bytes(contents::<u8>(&self.state.gdn), 0, self.n_gdn * self.cfg.gdn_state() * 4);
-            std::ptr::write_bytes(contents::<u8>(&self.state.conv), 0, self.n_gdn * self.cfg.conv_state() * 4);
-        }
+        gpu::zero(&self.state.gdn, self.n_gdn * self.cfg.gdn_state() * 4);
+        gpu::zero(&self.state.conv, self.n_gdn * self.cfg.conv_state() * 4);
     }
 
     /// Host access to the hidden input rows (for splicing image embeddings).
@@ -937,9 +937,12 @@ impl Text {
         (0..n).map(|i| unsafe { *p.add(i) }).collect()
     }
 
-    pub fn logits(&self, row: usize) -> &[f32] {
+    pub fn logits(&self, row: usize) -> Vec<f32> {
         let v = self.cfg.vocab;
-        unsafe { std::slice::from_raw_parts(contents::<f32>(&self.s.logits).add(row * v), v) }
+        gpu::read(&self.s.logits, row * v * 4, v * 4)
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
     }
 
     /// Encodes one decode step that reads its token from ring slot `k % 2` and writes the next token to
@@ -1030,17 +1033,16 @@ impl Text {
         }
     }
 
-    /// Host views of a snapshot's buffers (GDN state, conv state, K, V), for saving and loading it.
-    /// Only valid while no GPU work writes `s`.
-    pub fn state_bytes<'a>(&self, s: &'a State) -> [&'a mut [u8]; 4] {
+    /// A snapshot's buffers and their used bytes (GDN state, conv state, K, V), for saving and loading it with
+    /// `gpu::read` and `gpu::write`. Only while no GPU work writes `s`.
+    pub fn state_parts<'a>(&self, s: &'a State) -> [(&'a Buffer, usize); 4] {
         let c = &self.cfg;
         let kv = self.n_attn * s.cap * c.kv_width() * 4;
-        let part = |b: &Buffer, n: usize| unsafe { std::slice::from_raw_parts_mut(contents::<u8>(b), n) };
         [
-            part(&s.gdn, self.n_gdn * c.gdn_state() * 4),
-            part(&s.conv, self.n_gdn * c.conv_state() * 4),
-            part(&s.kc, kv),
-            part(&s.vc, kv),
+            (&s.gdn, self.n_gdn * c.gdn_state() * 4),
+            (&s.conv, self.n_gdn * c.conv_state() * 4),
+            (&s.kc, kv),
+            (&s.vc, kv),
         ]
     }
 }

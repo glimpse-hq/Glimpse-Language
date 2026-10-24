@@ -13,6 +13,13 @@ type Encoder = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
 type CmdBuf = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
 
 pub static METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.metallib"));
+/// Verify cost in decode steps for T = 1..=8 rows (the last token plus T - 1 drafts), accept included
+/// (`bonsai --verify-bench`, M2 Pro, results/rust.md "Optimization 2"). T = 2, 3 use qmvr, T >= 4 the MMA kernel.
+pub const VERIFY_COST_2B: [f64; 8] = [1.0, 1.57, 2.1, 2.6, 2.6, 2.6, 2.65, 2.65];
+pub const VERIFY_COST_4B: [f64; 8] = [1.0, 1.6, 2.15, 2.8, 2.85, 2.9, 2.95, 3.0];
+
+/// All kernels as built, for identifying saved states made with other kernels.
+pub static KERNEL_BLOB: &[u8] = METALLIB;
 
 pub struct Gpu {
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -69,6 +76,31 @@ impl Gpu {
             .expect("no-copy buffer")
     }
 
+    /// Same as `buffer` on Metal (all memory is shared); host-visible memory on Vulkan.
+    pub fn io_buffer(&self, bytes: usize) -> Buffer {
+        self.buffer(bytes)
+    }
+
+    pub fn device_name(&self) -> String {
+        self.device.name().to_string()
+    }
+
+    /// Maps `path` and wraps it as one zero-copy buffer. `regions` (file offset, bytes) stay where they are.
+    /// Returns the buffer and the mapping (pointer, length).
+    pub fn map_weights(&self, path: &std::path::Path, _regions: &mut [(usize, usize)]) -> Result<(Buffer, *const u8, usize), String> {
+        use std::os::fd::AsRawFd;
+        let f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let len = f.metadata().map_err(|e| e.to_string())?.len() as usize;
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let map_len = len.div_ceil(page) * page;
+        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), map_len, libc::PROT_READ, libc::MAP_SHARED, f.as_raw_fd(), 0) };
+        if ptr == libc::MAP_FAILED {
+            return Err("mmap failed".into());
+        }
+        let buf = unsafe { self.buffer_no_copy(ptr, map_len) };
+        Ok((buf, ptr as *const u8, len))
+    }
+
     pub fn begin(&self) -> Cmd<'_> {
         let cb = self.queue.commandBuffer().expect("command buffer");
         let enc = cb.computeCommandEncoder().expect("encoder");
@@ -82,6 +114,21 @@ impl Gpu {
 
 pub fn contents<T>(b: &Buffer) -> *mut T {
     b.contents().as_ptr() as *mut T
+}
+
+/// Host to buffer copy.
+pub fn write(b: &Buffer, off: usize, data: &[u8]) {
+    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), contents::<u8>(b).add(off), data.len()) };
+}
+
+/// Buffer to host copy.
+pub fn read(b: &Buffer, off: usize, len: usize) -> Vec<u8> {
+    unsafe { std::slice::from_raw_parts(contents::<u8>(b).add(off), len) }.to_vec()
+}
+
+/// Zeroes the first `len` bytes.
+pub fn zero(b: &Buffer, len: usize) {
+    unsafe { std::ptr::write_bytes(contents::<u8>(b), 0, len) };
 }
 
 /// A buffer binding: buffer plus byte offset.

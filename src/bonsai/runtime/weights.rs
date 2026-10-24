@@ -1,9 +1,9 @@
-//! Memory-maps model.safetensors and exposes it to the GPU as one zero-copy buffer.
+//! Exposes model.safetensors to the GPU as one buffer: memory-mapped without copying on Metal, uploaded on Vulkan.
 
 use super::gpu::{Buffer, Gpu};
 use std::collections::HashMap;
 use std::fs::File;
-use std::os::fd::AsRawFd;
+use std::io::Read;
 use std::path::Path;
 
 pub struct Tensor {
@@ -23,28 +23,16 @@ unsafe impl Send for Weights {}
 
 impl Weights {
     pub fn open(path: &Path, gpu: &Gpu) -> Result<Weights, String> {
-        let f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let len = f.metadata().map_err(|e| e.to_string())?.len() as usize;
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        let map_len = len.div_ceil(page) * page;
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                map_len,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                f.as_raw_fd(),
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            return Err("mmap failed".into());
-        }
-        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
-        let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
-        let header: serde_json::Value =
-            serde_json::from_slice(&bytes[8..8 + n]).map_err(|e| e.to_string())?;
-        let mut tensors = HashMap::new();
+        let mut f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut head = [0u8; 8];
+        f.read_exact(&mut head).map_err(|e| format!("{}: {e}", path.display()))?;
+        let n = u64::from_le_bytes(head) as usize;
+        let mut json = vec![0u8; n];
+        f.read_exact(&mut json).map_err(|e| format!("{}: {e}", path.display()))?;
+        let header: serde_json::Value = serde_json::from_slice(&json).map_err(|e| e.to_string())?;
+        let mut names = Vec::new();
+        let mut regions = Vec::new();
+        let mut shapes = Vec::new();
         for (k, v) in header.as_object().unwrap() {
             if k == "__metadata__" {
                 continue;
@@ -54,25 +42,27 @@ impl Weights {
                 o[0].as_u64().unwrap() as usize,
                 o[1].as_u64().unwrap() as usize,
             );
-            let shape = v["shape"]
+            let shape: Vec<usize> = v["shape"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .map(|x| x.as_u64().unwrap() as usize)
                 .collect();
-            tensors.insert(
-                k.clone(),
-                Tensor {
-                    off: 8 + n + a,
-                    bytes: b - a,
-                    shape,
-                },
-            );
+            names.push(k.clone());
+            regions.push((8 + n + a, b - a));
+            shapes.push(shape);
         }
-        let buf = unsafe { gpu.buffer_no_copy(ptr, map_len) };
+        // the backend may move tensors (Vulkan aligns each one); offsets below are into `buf`
+        let (buf, ptr, len) = gpu.map_weights(path, &mut regions)?;
+        let tensors = names
+            .into_iter()
+            .zip(regions)
+            .zip(shapes)
+            .map(|((k, (off, bytes)), shape)| (k, Tensor { off, bytes, shape }))
+            .collect();
         Ok(Weights {
             buf,
-            ptr: ptr as *const u8,
+            ptr,
             len,
             tensors,
         })
@@ -88,8 +78,10 @@ impl Weights {
         self.get(name).off
     }
 
+    /// Host bytes of a tensor (Metal only: the Vulkan backend keeps no host copy).
     pub fn bytes(&self, name: &str) -> &[u8] {
         let t = self.get(name);
+        assert!(!self.ptr.is_null(), "no host copy of the weights");
         assert!(t.off + t.bytes <= self.len);
         unsafe { std::slice::from_raw_parts(self.ptr.add(t.off), t.bytes) }
     }

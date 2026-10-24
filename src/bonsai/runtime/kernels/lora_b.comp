@@ -1,0 +1,17 @@
+#version 460
+#include "common.glsl"
+#include "qmv.glsl"
+// LoRA up projection after qmvr (T = 2, 3), added to up to three outputs: Y_i[t, o] += B_i[o] . u[t, i r ..).
+// Grid (ceil(total / 256), T).
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P { PTR B0; PTR Y0; PTR B1; PTR Y1; PTR B2; PTR Y2; PTR u; uint O0; uint O1; uint O2; uint r; uint R; } pc;
+void main() {
+    uint o = gl_GlobalInvocationID.x, t = gl_WorkGroupID.y;
+    PTR b, y; uint O, i;
+    if (o < pc.O0) { b = pc.B0; y = pc.Y0; O = pc.O0; i = 0u; }
+    else if (o < pc.O0 + pc.O1) { b = pc.B1; y = pc.Y1; O = pc.O1; i = 1u; o -= pc.O0; }
+    else if (o < pc.O0 + pc.O1 + pc.O2) { b = pc.B2; y = pc.Y2; O = pc.O2; i = 2u; o -= pc.O0 + pc.O1; }
+    else return;
+    uint yi = t * O + o;
+    Fp(y).v[yi] = Fp(y).v[yi] + lora_acc(pc.u, t * pc.R + i * pc.r, b, o * pc.r, pc.r);
+}

@@ -1,0 +1,34 @@
+#version 460
+#include "common.glsl"
+// Gated delta rule, sequential over T. State [NV, 128 (v), 128 (k)] fp32; v head h reads q/k head h / (NV / NK).
+// Grid (NV, 32), workgroup (32 lanes over k, 4 dv rows); each thread holds 4 k entries of one dv row. In place safe.
+layout(local_size_x = 32, local_size_y = 4) in;
+layout(push_constant) uniform P { PTR qkvc; PTR ab; PTR A_log; PTR dt_bias; PTR sin_; PTR sout; PTR y; uint T; uint NK; uint NV; } pc;
+void main() {
+    uint hd = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x;
+    uint NK = pc.NK, NV = pc.NV;
+    uint hk = hd / (NV / NK);
+    uint C = (2u * NK + NV) * 128u;
+    uint dv = gl_WorkGroupID.y * 4u + gl_LocalInvocationID.y;
+    uint base = (hd * 128u + dv) * 128u + lane * 4u;
+    vec4 st = f4(pc.sin_, base);
+    float ea = exp(Fp(pc.A_log).v[hd]);
+    float dtb = Fp(pc.dt_bias).v[hd];
+    for (uint t = 0u; t < pc.T; t++) {
+        uint ro = t * C;
+        vec4 q = f4(pc.qkvc, ro + hk * 128u + lane * 4u);
+        vec4 k = f4(pc.qkvc, ro + (NK + hk) * 128u + lane * 4u);
+        float v = Fp(pc.qkvc).v[ro + (2u * NK + hd) * 128u + dv];
+        float a = Fp(pc.ab).v[t * 2u * NV + hd] + dtb;
+        float sp = max(a, 0.0) + log(1.0 + exp(-abs(a)));
+        float g = exp(-ea * sp);
+        float beta = 1.0 / (1.0 + exp(-Fp(pc.ab).v[t * 2u * NV + NV + hd]));
+        st *= g;
+        float kv = subgroupAdd(dot(st, k));
+        float delta = (v - kv) * beta;
+        st += k * delta;
+        float o = subgroupAdd(dot(st, q));
+        if (lane == 0u) Fp(pc.y).v[t * NV * 128u + hd * 128u + dv] = o;
+    }
+    F4p(pc.sout).v[base >> 2] = st;
+}

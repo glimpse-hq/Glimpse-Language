@@ -4,7 +4,7 @@
 //! alpha / r already in B) and PEFT adapters (`...layers.N.<mod>.lora_A.weight`, alpha / r from the
 //! adapter_config.json next to the file). A of linears that share an input are stacked into one matrix.
 
-use super::gpu::{contents, Buffer, Gpu};
+use super::gpu::{self, Buffer, Gpu};
 use super::model::Text;
 use half::f16;
 use std::collections::HashMap;
@@ -168,6 +168,7 @@ pub fn load(path: &Path, scale: f32, text: &Text, gpu: &Gpu) -> Result<Lora, Str
         return Err("lora: no adapted linears".into());
     }
     let buf = gpu.buffer(halfs.len() * 2);
-    unsafe { std::ptr::copy_nonoverlapping(halfs.as_ptr(), contents::<u16>(&buf), halfs.len()) };
+    let bytes: Vec<u8> = halfs.iter().flat_map(|h| h.to_le_bytes()).collect();
+    gpu::write(&buf, 0, &bytes);
     Ok(Lora { buf, groups, max_rows, rank, linears: used })
 }

@@ -1,0 +1,15 @@
+#version 460
+#include "common.glsl"
+// New conv state = rows n, n+1, n+2 of [state_in (3), qkv]. One thread per channel; in place safe.
+layout(local_size_x = 128) in;
+layout(push_constant) uniform P { PTR qkv; PTR sin_; PTR sout; uint n; uint C; } pc;
+void main() {
+    uint c = gl_GlobalInvocationID.x, C = pc.C;
+    if (c >= C) return;
+    float r[3];
+    [[unroll]] for (uint j = 0u; j < 3u; j++) {
+        uint k = pc.n + j;
+        r[j] = k < 3u ? Fp(pc.sin_).v[k * C + c] : Fp(pc.qkv).v[(k - 3u) * C + c];
+    }
+    [[unroll]] for (uint j = 0u; j < 3u; j++) Fp(pc.sout).v[j * C + c] = r[j];
+}

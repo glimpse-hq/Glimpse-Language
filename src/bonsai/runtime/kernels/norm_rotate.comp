@@ -1,0 +1,32 @@
+#version 460
+#include "common.glsl"
+// h[t] -> xn = rmsnorm(h) * w (optional), xr = fwht(signs * xn) / sqrt(512). Grid (T, chunks + LoRA rows).
+layout(local_size_x = 128) in;
+layout(push_constant) uniform P { PTR h; PTR w; PTR signs; PTR xn; PTR xr; uint D; uint write_xn; PTR A; PTR U; uint R; } pc;
+shared float red[16];
+shared float lred[16];
+#include "rot.glsl"
+
+void main() {
+    uint D = pc.D, K = D, t = gl_WorkGroupID.x, nch = (D + CHUNK - 1u) / CHUNK;
+    uint xo = t * D;
+    uint c0 = gl_WorkGroupID.y * CHUNK + SID * 512u + LANE;
+    bool mine = gl_WorkGroupID.y < nch && c0 < D;
+    float xv[16], wv[16], sv[16];
+    if (mine) [[unroll]] for (uint i = 0u; i < 16u; i++) {
+        uint e = c0 + 32u * i;
+        xv[i] = Fp(pc.h).v[xo + e]; wv[i] = Fp(pc.w).v[e]; sv[i] = Fp(pc.signs).v[e];
+    }
+    float r = inversesqrt(row_ss(pc.h, xo, D) / float(D) + EPS);
+    LORA_ROW(nch, f4(pc.h, xo + k) * r * f4(pc.w, k))
+    if (!mine) return;
+    float v[16];
+    [[unroll]] for (uint i = 0u; i < 16u; i++) {
+        uint e = c0 + 32u * i;
+        float a = (xv[i] * r) * wv[i];
+        if (pc.write_xn != 0u) Fp(pc.xn).v[xo + e] = a;
+        v[i] = a * sv[i];
+    }
+    fwht512(v);
+    [[unroll]] for (uint i = 0u; i < 16u; i++) Fp(pc.xr).v[xo + c0 + 32u * i] = v[i] * INV_SQRT512;
+}

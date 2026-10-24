@@ -1,0 +1,25 @@
+#version 460
+#include "common.glsl"
+#include "qmv.glsl"
+// Up to three matvecs sharing one input in one dispatch (rows of matrix i follow matrix i - 1), 2 subgroups x
+// 4 rows per workgroup, LoRA epilogue per matrix, and the GDN a/b gate rows riding along, 2 per extra workgroup.
+// Grid OT / 8 + NV.
+layout(local_size_x = 64) in;
+layout(push_constant) uniform P {
+    PTR W0; PTR S0; PTR Y0; PTR W1; PTR S1; PTR Y1; PTR W2; PTR S2; PTR Y2; PTR x; uint K; uint O0; uint O1;
+    PTR B0; PTR B1; PTR B2; PTR u; uint lr; PTR Wa; PTR Wb; PTR xn; PTR ab; uint NV; uint OT;
+} pc;
+void main() {
+    uint tg = gl_WorkGroupID.x;
+    if (tg * 8u >= pc.OT) {
+        gdn_ab_row(pc.Wa, pc.Wb, pc.xn, pc.ab, pc.NV, pc.K, (tg - pc.OT / 8u) * 2u + SID, 0u);
+        return;
+    }
+    uint r = (tg * 2u + SID) * 4u;
+    PTR W, S, y, B;
+    uint uo = 0u;
+    if (r < pc.O0) { W = pc.W0; S = pc.S0; y = pc.Y0; B = pc.B0; }
+    else if (r < pc.O0 + pc.O1) { W = pc.W1; S = pc.S1; y = pc.Y1; B = pc.B1; r -= pc.O0; uo = pc.lr; }
+    else { W = pc.W2; S = pc.S2; y = pc.Y2; B = pc.B2; r -= pc.O0 + pc.O1; uo = 2u * pc.lr; }
+    qmv_rows4(W, S, pc.x, 0u, y, 0u, pc.K, r, 0u, B, pc.u, uo, pc.lr);
+}

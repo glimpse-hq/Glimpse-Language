@@ -1,0 +1,30 @@
+#version 460
+#include "common.glsl"
+// Argmax over V per row, stage 1: each workgroup scans a slice and writes (value, index). Grid (groups, rows).
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P { PTR x; PTR pv; PTR pi; uint V; } pc;
+shared float rv[8];
+shared int ri[8];
+void main() {
+    uint row = gl_WorkGroupID.y, ng = gl_NumWorkGroups.x, tid = gl_LocalInvocationIndex, V = pc.V;
+    uint chunk = (V + ng - 1u) / ng;
+    uint b = gl_WorkGroupID.x * chunk, e = min(V, b + chunk);
+    float bv = NEG_INF;
+    int bi = int(b);
+    for (uint i = b + tid; i < e; i += 256u) {
+        float v = Fp(pc.x).v[row * V + i];
+        if (v > bv) { bv = v; bi = int(i); }
+    }
+    for (uint o = 16u; o > 0u; o >>= 1) {
+        float ov = subgroupShuffleDown(bv, o);
+        int oi = subgroupShuffleDown(bi, o);
+        if (LANE + o < 32u && (ov > bv || (ov == bv && oi < bi))) { bv = ov; bi = oi; }
+    }
+    if (LANE == 0u) { rv[SID] = bv; ri[SID] = bi; }
+    barrier();
+    if (tid == 0u) {
+        for (uint s = 1u; s < 8u; s++) if (rv[s] > bv || (rv[s] == bv && ri[s] < bi)) { bv = rv[s]; bi = ri[s]; }
+        Fp(pc.pv).v[row * ng + gl_WorkGroupID.x] = bv;
+        Ip(pc.pi).v[row * ng + gl_WorkGroupID.x] = bi;
+    }
+}

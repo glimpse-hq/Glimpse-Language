@@ -1,0 +1,49 @@
+#version 460
+#include "common.glsl"
+#include "qmv.glsl"
+// Verify matmul (T <= 8 tokens): each subgroup computes 8 rows (two passes of 4) for all T tokens. Codes are
+// decoded to floats once per 16-code step and reused by every token. Grid O / 32, 4 subgroups per workgroup.
+// LoRA up projection in the store.
+layout(local_size_x = 128) in;
+layout(push_constant) uniform P { PTR W; PTR S; PTR X; PTR Y; uint K; uint O; uint add; uint T; PTR Bm; PTR u; uint lr; uint UR; } pc;
+void main() {
+    uint K = pc.K, kw = K / 16u, kg = K / 128u, T = pc.T;
+    uint n0 = (gl_WorkGroupID.x * 4u + SID) * 8u;
+    [[unroll]] for (uint p = 0u; p < 2u; p++) {
+        uint r0 = n0 + p * 4u;
+        float acc[4][8];
+        [[unroll]] for (uint r = 0u; r < 4u; r++) [[unroll]] for (uint t = 0u; t < 8u; t++) acc[r][t] = 0.0;
+        for (uint k0 = LANE * 16u; k0 < K; k0 += 512u) {
+            float c[4][16];
+            float sc[4];
+            [[unroll]] for (uint r = 0u; r < 4u; r++) {
+                uint wd = Up(pc.W).v[(r0 + r) * kw + k0 / 16u];
+                sc[r] = half_at(pc.S, (r0 + r) * kg + k0 / 128u);
+                [[unroll]] for (uint j = 0u; j < 16u; j++) c[r][j] = float((wd >> (2u * j)) & 3u);
+            }
+            [[unroll]] for (uint t = 0u; t < 8u; t++) {
+                if (t < T) {
+                    uint xo = t * K + k0;
+                    vec4 xq[4] = vec4[4](f4(pc.X, xo), f4(pc.X, xo + 4u), f4(pc.X, xo + 8u), f4(pc.X, xo + 12u));
+                    float xs = 0.0;
+                    [[unroll]] for (uint j = 0u; j < 8u; j++) xs += xq[j / 4u][j % 4u] + xq[2u + j / 4u][j % 4u];
+                    [[unroll]] for (uint r = 0u; r < 4u; r++) {
+                        float d = 0.0;
+                        [[unroll]] for (uint j = 0u; j < 8u; j++)
+                            d += xq[j / 4u][j % 4u] * c[r][j] + xq[2u + j / 4u][j % 4u] * c[r][j + 8u];
+                        acc[r][t] += sc[r] * (d - xs);
+                    }
+                }
+            }
+        }
+        // lane r * 8 + t keeps output (row r0 + r, token t) and stores it, all lanes at once
+        float mine = 0.0;
+        [[unroll]] for (uint r = 0u; r < 4u; r++)
+            [[unroll]] for (uint t = 0u; t < 8u; t++) {
+                float v = subgroupAdd(acc[r][t]);
+                if (LANE == r * 8u + t) mine = v;
+            }
+        uint rr = LANE / 8u, tt = LANE % 8u, n = r0 + rr;
+        if (tt < T) store_post(pc.Y, tt * pc.O + n, mine, pc.add, pc.Bm, n * pc.lr, pc.u, tt * pc.UR, pc.lr);
+    }
+}

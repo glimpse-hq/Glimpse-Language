@@ -3,7 +3,7 @@
 On-device language models for Rust, macOS and Windows. One crate, one Cargo feature per model, each run the fastest way we know on that platform. What Glimpse Speech is to speech, this is to text.
 
 - **Apple Foundation Models**: Apple's on-device model (macOS 26, Apple Silicon) through a small Swift shim
-- **Ternary Bonsai 2** (2B and 4B): PrismML's ternary Qwen3.5 hybrid on our own Metal runtime (macOS 14, Apple Silicon) and on libllama over Vulkan (Windows), with a cached system prompt, prompt-lookup speculation and LoRA adapters.
+- **Ternary Bonsai 2** (2B and 4B): PrismML's ternary Qwen3.5 hybrid on our own runtime, Metal kernels on macOS 14 (Apple Silicon) and Vulkan kernels on Windows, with a cached system prompt, prompt-lookup speculation and LoRA adapters.
 
 Requests are single turn: a system prompt plus user text in, text out.
 
@@ -12,7 +12,7 @@ Requests are single turn: a system prompt plus user text in, text out.
 | Feature | Enables |
 | --- | --- |
 | `apple` | `apple`, generation with Apple's on-device Foundation Models (Apple Silicon, macOS 26) |
-| `bonsai` | `bonsai`, Ternary Bonsai 2 on the GPU (Apple Silicon, macOS 14; Windows with a Vulkan GPU). Compiles Metal kernels on macOS and libllama on Windows at build time, see below |
+| `bonsai` | `bonsai`, Ternary Bonsai 2 on the GPU (Apple Silicon, macOS 14; Windows with a Vulkan 1.3 GPU). Compiles its Metal or Vulkan kernels at build time, see below |
 
 On a platform a model does not support, its module still builds and reports itself unsupported, so callers need no `cfg` of their own.
 
@@ -43,11 +43,9 @@ xcodebuild -downloadComponent MetalToolchain
 xcrun -sdk macosx -f metal
 ```
 
-### libllama (bonsai, Windows)
+### Vulkan toolchain (bonsai, Windows)
 
-On Windows `build.rs` compiles libllama from `vendor/llama.cpp` (ggml-org/llama.cpp `9ff0d7e90`, `src/` and `include/llama.h` only) and our C glue in `src/bonsai/ggml/` into one static library. ggml comes from `transcribe-cpp-sys`, the same crate and rev Glimpse Speech uses, so the process links one ggml with one Vulkan backend. `vendor/ggml/include` holds that rev's headers. Keep the `transcribe-cpp-sys` rev in `Cargo.toml` equal to Glimpse Speech's; Cargo refuses two copies (`links = "transcribe"`). The build needs what transcribe.cpp's Vulkan build needs: the Vulkan SDK, CMake and MSVC. Pass `TRANSCRIBE_CMAKE_ARGS=-DGGML_NATIVE=OFF -DGGML_AVX2=ON` for binaries that run on other machines.
-
-To move to a newer llama.cpp, replace `vendor/llama.cpp/src` and `include/llama.h` with the new commit's (drop `src/CMakeLists.txt`, write `src/llama-version.h`), then reapply the one local change: `build_lora_mm` in `llama-graph.cpp` skips the `ggml_scale` when the scale is 1. `src/bonsai/ggml/compat.h` stubs the three ggml 0.27 symbols libllama uses that transcribe.cpp's ggml 0.26 lacks; drop it once transcribe.cpp syncs ggml past 0.27.
+`build.rs` compiles `src/bonsai/runtime/kernels/*.comp` to SPIR-V with `glslc` from the Vulkan SDK (`VULKAN_SDK`, or `glslc` on `PATH`), and the runtime embeds it, so the app never compiles shaders. Vulkan itself is loaded at run time (`ash`), so a machine without it runs the app and reports Bonsai unsupported.
 
 ## Library
 
@@ -81,32 +79,36 @@ if availability() == Availability::Available {
 # Ok::<(), glimpse_language::bonsai::BonsaiError>(())
 ```
 
-- `availability()`: Apple Silicon (Apple7 GPU family, M1 and later) on macOS 14 or later, or a Windows machine with a Vulkan GPU (the first discrete one, else the first integrated one), in a build with the feature. There is no CPU fallback: a 50-word cleanup takes over 20 s on a 24-core Xeon. Cached after the first call.
+- `availability()`: Apple Silicon (Apple7 GPU family, M1 and later) on macOS 14 or later, or on Windows a Vulkan 1.3 GPU with buffer device addresses and 32-wide subgroups (NVIDIA; AMD RDNA and Intel Arc or Xe through subgroup size control; the first discrete GPU, else the first integrated one), in a build with the feature. There is no CPU fallback: a 50-word cleanup takes over 20 s on a 24-core Xeon. Cached after the first call.
 - `describe(dir)` and `parse_config(json)`: size (`ModelSize::B2` or `B4`) and shape from config.json, no GPU.
-- `Bonsai::load(dir, adapter)`: maps the weights without copying and builds the GPU state, about 25 ms warm. The first request after a cold start pays for paging the weights in (about 0.5 s on the 2B).
+- `Bonsai::load(dir, adapter)`: on Metal maps the weights without copying and builds the GPU state, about 25 ms warm; the first request after a cold start pays for paging the weights in (about 0.5 s on the 2B). On Vulkan it uploads the weights, 0.4 to 0.6 s for the 2B and 0.8 to 1.0 s for the 4B warm; the first load on a machine (or after a driver update) also builds the GPU pipelines from the embedded SPIR-V, about 2 s more.
 - `prewarm(system_prompt)`: prefills the system prompt and keeps its state on the GPU. `generate` with the same prompt restores it and prefills only the user turn. The three most recent prompts stay cached (about 34 MB each on the 2B with Glimpse's cleanup prompt, 90 MB on the 4B) and are saved to `prefix-cache/` in the model directory, so the first request after a restart skips the system prompt too. A saved state is only used by the same executable, GPU, model files, adapter and prompt tokens.
 - `generate(system_prompt, user_text, options, cancel)`: greedy decoding until the end-of-turn token or `max_tokens`. Setting `cancel` stops within one step. The prompt is the Qwen3.5 chat template with an empty think block. `max_tokens` is lowered to the room left in the 2048-position context; `StopReason::ContextFull` says so, and a prompt with no room at all fails with `ContextTooLarge`.
-- `release_idle()`: frees the GPU buffers (about 240 MB on the 2B) and keeps the weights mapped and the cached prompt states. The next call rebuilds them in a few tens of ms and rereads the adapter.
+- `release_idle()`: frees the GPU buffers (about 240 MB on the 2B) and keeps the weights (mapped on Metal, in GPU memory on Vulkan: 0.54 GB for the 2B, 1.2 GB for the 4B) and the cached prompt states. The next call rebuilds them in a few tens of ms and rereads the adapter. Drop the `Bonsai` to free the weights.
 - Calls on one `Bonsai` are serialized by a mutex. A runtime panic becomes a `Runtime` error and the model reloads on the next call.
 
-Speculation drafts up to 7 tokens from the text inside the request's `<transcript>` or `<text>` block (the whole user turn without one): fillers dropped, matched on lowercase words (n-grams of 3 down to 1), with the casing and apostrophes a cleanup adds. Drafts are verified in one pass; the draft length follows recent acceptance, and the request decodes plainly while drafting does not pay. Output is token for token the plain greedy output.
+Speculation drafts up to 7 tokens from the text inside the request's `<transcript>` or `<text>` block (the whole user turn without one): fillers dropped, matched on lowercase words (n-grams of 3 down to 1), with the casing and apostrophes a cleanup adds. Drafts are verified in one pass; the draft length follows recent acceptance, and the request decodes plainly while drafting does not pay. On Metal the output is token for token the plain greedy output; on Vulkan it can differ only where two logits nearly tie.
 
-LoRA adapters are safetensors files: bonsai/train.py's export, or PEFT `adapter_model.safetensors` with `adapter_config.json` beside it. Decode cost is 0 to 2% on Metal. On Windows the same file is converted to a GGUF LoRA at load (temporary file, V heads reordered for the 4B) and costs about 20 to 25% decode, since libllama applies it as separate matmuls.
+LoRA adapters are safetensors files: bonsai/train.py's export, or PEFT `adapter_model.safetensors` with `adapter_config.json` beside it. Decode cost is 0 to 2% on Metal and about 7% on Vulkan (fused into the matvec epilogue, and run as extra k steps of the cooperative-matrix matmuls).
 
-On Windows (libllama over Vulkan) the behavior is the same with these differences: drafts are at most 4 tokens (verify rows cost more there, and every rollback snapshot of the recurrent state costs memory); greedy output can differ from Metal where two logits nearly tie (2 of 239 test prompts on an RTX 4000 Ada, 0 on an RTX 3080); the first load on a machine builds Vulkan pipelines for about a minute, after which the driver caches them, so warm it in the background, not on the dictation path; `release_idle` also frees the weights (about 0.9 GB of GPU memory in use while loaded); a failed ggml assertion aborts the process instead of returning an error.
+On Windows the runtime is the same Rust (model, tokenizer, LoRA, speculation, prefix cache) over `runtime/gpu_vk.rs` and GLSL ports of the Metal kernels, with these differences:
+- Matmuls over more than one token (verify, prefill) run on 16x16x16 cooperative matrices: weights are exact in fp16 and each activation is split into fp16 hi and lo parts, so products keep about 22 bits. GPUs without them (or with `BONSAI_NO_COOPMAT=1`) use scalar kernels: same outputs, about twice the prefill time.
+- Command streams seen before are replayed from cached command buffers, with the attention offset and split count read from a parameter slot, so a decode or verify step does not re-record about 280 dispatches.
+- Speculation uses its own cost table (`gpu::VERIFY_COST_*`): a verify round costs about 2.2 decode steps whether it checks 1 or 7 drafts.
+- On the 239-prompt suite (Glimpse's cleanup cases plus Glimpse-Lab's) the greedy output matched the Metal runtime on every prompt for the 2B and the 4B, on an RTX 4000 Ada and an RTX 3080.
+- `BONSAI_PROFILE=1` prints per-kernel GPU times (and GB/s for the matmuls) when the model is dropped.
 
 ### Expected model files
 
 | Model | Required files |
 | --- | --- |
-| Ternary Bonsai 2 2B or 4B, macOS | `model.safetensors`, `config.json` and `tokenizer.json` from PrismML's MLX 2-bit pack |
-| Ternary Bonsai 2 2B or 4B, Windows | `model.gguf` (PrismML's `Ternary-Bonsai-2-2B-Q2_0.gguf` or `-4B-Q2_0.gguf`, renamed), plus `config.json` and `tokenizer.json` from the MLX pack |
+| Ternary Bonsai 2 2B or 4B (macOS and Windows) | `model.safetensors`, `config.json` and `tokenizer.json` from PrismML's MLX 2-bit pack |
 
 The runtime writes a parsed tokenizer cache, `tokenizer.bonsai` (6.8 MB), next to `tokenizer.json`, and saved prompt states in `prefix-cache/`. Keep the model directory writable or the tokenizer is parsed on every load (about 300 ms) and every new process prefills its system prompt.
 
 ## Bonsai runtime sync
 
-The Metal runtime is developed in Glimpse-Lab (`g1/rust/`). `src/bonsai/runtime/` holds a copy with `crate::` paths rewritten to `super::`, plus `ext.rs` (ours: template, idle release, cancel, context checks) and `scripts/bonsai-runtime.patch` (adds `mod ext` and the cancel checks in the decode loops). To pull runtime changes:
+The runtime (shared Rust, the Metal and Vulkan layers, `kernels.metal` and `kernels/`) is developed in Glimpse-Lab (`g1/rust/`). `src/bonsai/runtime/` holds a copy with `crate::` paths rewritten to `super::`, plus `ext.rs` (ours: template, idle release, cancel, context checks) and `scripts/bonsai-runtime.patch` (adds `mod ext` and the cancel checks in the decode loops). To pull runtime changes:
 
 ```bash
 scripts/sync-bonsai.sh ../Glimpse-Lab/g1/rust
@@ -115,9 +117,9 @@ BONSAI_MODEL_DIR=/path/to/2b cargo test --release --features bonsai --test bonsa
 BONSAI_MODEL_DIR=/path/to/4b cargo test --release --features bonsai --test bonsai_golden -- --ignored
 ```
 
-If the patch no longer applies, redo its three small changes by hand and regenerate it with `diff -u`. Do not edit the copied files directly. Current copy: Glimpse-Lab `g1/rust/` as of 2026-10-23.
+If the patch no longer applies, redo its small changes by hand and regenerate it with `diff -u`. Do not edit the copied files directly. Current copy: Glimpse-Lab `g1/rust/` on branch `vulkan-runtime` (6a42f93), 2026-10-23.
 
-The golden test compares output with PrismML's MLX runtime on the prompts in `tests/golden`, cold, from the cached prompt and without speculation.
+The golden test compares output with PrismML's MLX runtime on the prompts in `tests/golden`, cold, from the cached prompt and without speculation. It runs on Windows too (Vulkan).
 
 Known runtime gaps: weights are never unmapped, so dropping a `Bonsai` leaves the mapping (clean file pages) until exit; input is not NFC normalized before tokenizing; the vision tower is compiled but not exposed.
 

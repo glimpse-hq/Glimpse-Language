@@ -2,6 +2,10 @@
 //! greedy decoding, text plus images, optional LoRA adapter.
 //! Single turn by design: optional system prompt (prefilled once and cached) plus user input, optional image.
 
+#[cfg(target_os = "macos")]
+pub mod gpu;
+#[cfg(not(target_os = "macos"))]
+#[path = "gpu_vk.rs"]
 pub mod gpu;
 pub mod lora;
 pub mod model;
@@ -148,10 +152,6 @@ fn encode_pending(pending: &mut Option<(usize, usize)>, text: &mut Text, wb: &gp
     }
 }
 
-/// Verify cost in decode steps for T = 1..=8 rows (the last token plus T - 1 drafts), accept included
-/// (`bonsai --verify-bench`, M2 Pro, results/rust.md "Optimization 2"). T = 2, 3 use qmvr, T >= 4 the MMA kernel.
-const VERIFY_COST_2B: [f64; 8] = [1.0, 1.57, 2.1, 2.6, 2.6, 2.6, 2.65, 2.65];
-const VERIFY_COST_4B: [f64; 8] = [1.0, 1.6, 2.15, 2.8, 2.85, 2.9, 2.95, 3.0];
 /// Expected gain (tokens per step relative to plain decoding) needed to keep speculating, and the higher bar
 /// for switching back from plain decoding (hysteresis). The margin covers what the cost table leaves out
 /// (a host sync per round where plain decoding is pipelined, estimate noise); 1.0 lost 5% on the 4B w120 case.
@@ -496,14 +496,14 @@ impl Model {
             Some([m.len(), t.as_nanos() as u64])
         };
         let mut id = PREFIX_MAGIC.to_vec();
-        let mut words = vec![hash_bytes(FNV, gpu::METALLIB), self.adapter];
+        let mut words = vec![hash_bytes(FNV, gpu::KERNEL_BLOB), self.adapter];
         words.extend(stamp(&std::env::current_exe().ok()?)?);
         words.extend(stamp(&self.dir.join("model.safetensors"))?);
         words.push(hash_bytes(FNV, &std::fs::read(self.dir.join("config.json")).ok()?));
         let c = &self.text.cfg;
         words.extend([self.text.n_gdn, self.text.n_attn, c.hidden, c.kv_width(), c.conv_dim()].map(|v| v as u64));
         id.extend(words.iter().flat_map(|w| w.to_le_bytes()));
-        id.extend(objc2_metal::MTLDevice::name(&*self.gpu.device).to_string().bytes());
+        id.extend(self.gpu.device_name().bytes());
         Some(id)
     }
 
@@ -530,8 +530,10 @@ impl Model {
             return None;
         }
         let mut snap = self.new_snapshot(len);
-        for part in self.text.state_bytes(&snap) {
-            f.read_exact(part).ok()?;
+        for (buf, n) in self.text.state_parts(&snap) {
+            let mut part = vec![0u8; n];
+            f.read_exact(&mut part).ok()?;
+            gpu::write(buf, 0, &part);
         }
         if f.read(&mut [0u8]).ok()? != 0 {
             return None;
@@ -549,8 +551,8 @@ impl Model {
         data.extend(p.ids.iter().flat_map(|t| t.to_le_bytes()));
         data.extend((p.snap.len as u64).to_le_bytes());
         data.extend((p.snap.pos as i64).to_le_bytes());
-        for part in self.text.state_bytes(&p.snap) {
-            data.extend_from_slice(part);
+        for (buf, n) in self.text.state_parts(&p.snap) {
+            data.extend(gpu::read(buf, 0, n));
         }
         std::thread::spawn(move || {
             let tmp = path.with_extension("tmp");
@@ -777,7 +779,7 @@ impl Model {
         stream: &mut Utf8Stream,
         emit: &mut impl FnMut(&str),
     ) {
-        let cost = if self.text.cfg.hidden <= 2048 { &VERIFY_COST_2B } else { &VERIFY_COST_4B };
+        let cost = if self.text.cfg.hidden <= 2048 { &gpu::VERIFY_COST_2B } else { &gpu::VERIFY_COST_4B };
         let mut pol = Policy::new(cost, sp.draft_max);
         let keys = self.keys.get_or_init(|| {
             std::sync::Arc::new((0..self.tok.vocab_len() as u32).map(|id| token_key(self.tok.token_bytes(id))).collect())
