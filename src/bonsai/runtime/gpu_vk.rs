@@ -47,14 +47,15 @@ impl Drop for Shared {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
-            let cache = self.cache.get_mut().unwrap();
+            // after a caught panic the locks may be poisoned; the data is still valid to free
+            let cache = self.cache.get_mut().unwrap_or_else(|e| e.into_inner());
             for (_, e) in cache.entries.drain().chain(cache.doomed.drain(..)) {
                 e.params.free(&self.device);
             }
-            for f in self.fences.get_mut().unwrap().drain(..) {
+            for f in self.fences.get_mut().unwrap_or_else(|e| e.into_inner()).drain(..) {
                 self.device.destroy_fence(f, None);
             }
-            self.device.destroy_command_pool(self.pool.get_mut().unwrap().pool, None);
+            self.device.destroy_command_pool(self.pool.get_mut().unwrap_or_else(|e| e.into_inner()).pool, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -251,10 +252,11 @@ pub fn zero(b: &Buffer, len: usize) {
     sh.oneshot(|cb| unsafe { sh.device.cmd_fill_buffer(cb, b.0.buf, 0, (len as u64).div_ceil(4) * 4, 0) });
 }
 
-/// Why this machine cannot run the kernels, or the chosen device.
-fn pick_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32, String), String> {
+/// Why this machine cannot run the kernels, or the chosen device: (device, queue family, name, whether pipelines
+/// must require 32-wide subgroups).
+fn pick_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32, String, bool), String> {
     let devices = unsafe { instance.enumerate_physical_devices() }.map_err(|e| format!("Vulkan devices: {e}"))?;
-    let mut best: Option<(u32, vk::PhysicalDevice, u32, String)> = None;
+    let mut best: Option<(u32, vk::PhysicalDevice, u32, String, bool)> = None;
     let mut why = String::from("no Vulkan GPU");
     for pd in devices {
         let props = unsafe { instance.get_physical_device_properties(pd) };
@@ -281,7 +283,9 @@ fn pick_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32, Str
             | vk::SubgroupFeatureFlags::ARITHMETIC
             | vk::SubgroupFeatureFlags::SHUFFLE
             | vk::SubgroupFeatureFlags::SHUFFLE_RELATIVE;
-        let sized = sg.subgroup_size == SUBGROUP
+        // SPIR-V 1.6 lets the driver pick any size in [min, max] unless the pipeline requires one
+        let fixed = sg.subgroup_size == SUBGROUP && sgc.min_subgroup_size == SUBGROUP && sgc.max_subgroup_size == SUBGROUP;
+        let sized = fixed
             || (f13.subgroup_size_control == vk::TRUE
                 && f13.compute_full_subgroups == vk::TRUE
                 && sgc.min_subgroup_size <= SUBGROUP
@@ -301,11 +305,11 @@ fn pick_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32, Str
                 continue;
             };
             if best.as_ref().is_none_or(|b| score > b.0) {
-                best = Some((score, pd, q as u32, name));
+                best = Some((score, pd, q as u32, name, !fixed));
             }
         }
     }
-    best.map(|(_, pd, q, n)| (pd, q, n)).ok_or(why)
+    best.map(|(_, pd, q, n, control)| (pd, q, n, control)).ok_or(why)
 }
 
 fn instance() -> Result<(ash::Entry, ash::Instance), String> {
@@ -322,7 +326,7 @@ pub fn available() -> Result<String, String> {
     PROBE
         .get_or_init(|| {
             let (_entry, inst) = instance()?;
-            let r = pick_device(&inst).map(|(_, _, n)| n);
+            let r = pick_device(&inst).map(|(_, _, n, _)| n);
             unsafe { inst.destroy_instance(None) };
             r
         })
@@ -396,18 +400,14 @@ impl Drop for Gpu {
 impl Gpu {
     pub fn new() -> Result<Gpu, String> {
         let (entry, instance) = instance()?;
-        let (pd, qfam, name) = match pick_device(&instance) {
+        let (pd, qfam, name, control) = match pick_device(&instance) {
             Ok(d) => d,
             Err(e) => {
                 unsafe { instance.destroy_instance(None) };
                 return Err(e);
             }
         };
-        let mut sg = vk::PhysicalDeviceSubgroupProperties::default();
-        let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sg);
-        unsafe { instance.get_physical_device_properties2(pd, &mut p2) };
-        let ts_period = p2.properties.limits.timestamp_period;
-        let control = sg.subgroup_size != SUBGROUP;
+        let ts_period = unsafe { instance.get_physical_device_properties(pd) }.limits.timestamp_period;
         let coopmat = has_coopmat(&entry, &instance, pd);
         let prio = [1.0f32];
         let qinfo = [vk::DeviceQueueCreateInfo::default().queue_family_index(qfam).queue_priorities(&prio)];
@@ -825,11 +825,11 @@ impl<'g> Cmd<'g> {
                 .collect();
             return self.dispatch(name, &a, (groups.0, ns, groups.2), threads);
         }
-        if name == "attn_combine"
-            && let Some(ns) = self.attn_ns.take()
-        {
-            let a = [copy(&args[0]), copy(&args[1]), Arg::U32(ns), copy(&args[3])];
-            return self.dispatch(name, &a, groups, threads);
+        if name == "attn_combine" {
+            if let Some(ns) = self.attn_ns.take() {
+                let a = [copy(&args[0]), copy(&args[1]), Arg::U32(ns), copy(&args[3])];
+                return self.dispatch(name, &a, groups, threads);
+            }
         }
         // K = 2048: 2 subgroups x 4 rows per workgroup (as Metal); longer K (the MLP down projection): 4 rows per
         // workgroup with K split over 4 subgroups, which halves its latency on the RTX 4000 Ada

@@ -74,8 +74,8 @@ if availability() == Availability::Available {
 - `availability()`: Apple Silicon on macOS 14+, or a Vulkan 1.3 GPU on Windows (NVIDIA, AMD RDNA, Intel Arc or Xe). No CPU fallback.
 - `Bonsai::load(dir, adapter)`: loads the model and an optional LoRA adapter.
 - `prewarm(system_prompt)`: caches the system prompt so `generate` prefills only the user turn. The last three prompts are cached and saved to `prefix-cache/` for the next launch.
-- `generate(...)`: greedy decoding until end of turn or `max_tokens`. `cancel` stops it within one step.
-- `release_idle()`: frees the GPU buffers and keeps the weights. Drop the `Bonsai` to free everything.
+- `generate(...)`: greedy decoding until end of turn or `max_tokens`. `cancel` stops decoding within one step.
+- `release_idle()`: frees the GPU buffers and keeps the weights and cached prompts. Drop the `Bonsai` to free everything.
 
 Speculation drafts tokens from the user's own text and verifies them in one pass. On Metal the output is identical to plain greedy decoding.
 
@@ -97,4 +97,4 @@ cargo test --features bonsai
 BONSAI_MODEL_DIR=/path/to/2b cargo test --release --features bonsai --test bonsai_golden -- --ignored
 ```
 
-The golden test checks output against PrismML's MLX runtime. Current copy: Glimpse-Lab `prefix-cache` at 7d738a8.
+The golden test checks output against PrismML's MLX runtime. It deletes the model directory's `prefix-cache/`, so point it at a copy. Current copy: Glimpse-Lab `prefix-cache` at 73599f3.

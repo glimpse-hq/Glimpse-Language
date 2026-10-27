@@ -1,7 +1,7 @@
 #version 460
 #include "common.glsl"
 // Argmax stage 2: one thread per row reduces the stage-1 partials. `rows` is the dispatch's thread count.
-layout(local_size_x = 16) in;
+layout(local_size_x = 32) in;
 layout(push_constant) uniform P { PTR pv; PTR pi; PTR out_; uint n; uint rows; } pc;
 void main() {
     uint row = gl_LocalInvocationIndex;
