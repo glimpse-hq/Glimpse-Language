@@ -1,7 +1,7 @@
 //! Qwen3.5 hybrid text model (Gated DeltaNet + gated attention layers) encoded as Metal dispatches.
 //! All sizes come from config.json (Ternary Bonsai 2 2B and 4B).
 
-use super::gpu::{contents, Arg, Buffer, Cmd, Gpu, B};
+use super::gpu::{self, contents, Arg, Buffer, Cmd, Gpu, B};
 use super::lora::{Group, Lora};
 use super::weights::Weights;
 
@@ -177,6 +177,8 @@ pub struct State {
     conv: Buffer,
     kc: Buffer,
     vc: Buffer,
+    /// KV positions per attention layer (ctx for the live state, the prefix length for a snapshot).
+    pub cap: usize,
     /// Tokens in the KV cache.
     pub len: usize,
     /// Next mrope position (differs from len after an image).
@@ -257,6 +259,7 @@ impl State {
             conv: gpu.buffer(n_gdn * cfg.conv_state() * 4),
             kc: gpu.buffer(n_attn * ctx * cfg.kv_width() * 4),
             vc: gpu.buffer(n_attn * ctx * cfg.kv_width() * 4),
+            cap: ctx,
             len: 0,
             pos: 0,
         }
@@ -312,12 +315,14 @@ impl Text {
             .collect();
         let half = cfg.rotary_dims / 2;
         let inv_freq = gpu.buffer(half * 4);
-        let f = contents::<f32>(&inv_freq);
-        for i in 0..half {
-            unsafe { *f.add(i) = 1.0 / (cfg.rope_theta as f32).powf((2 * i) as f32 / cfg.rotary_dims as f32) };
-        }
+        let freqs: Vec<u8> = (0..half)
+            .flat_map(|i| (1.0 / (cfg.rope_theta as f32).powf((2 * i) as f32 / cfg.rotary_dims as f32)).to_le_bytes())
+            .collect();
+        gpu::write(&inv_freq, 0, &freqs);
         let logit_rows = VMAX;
         let f4 = |n: usize| gpu.buffer(n * 4);
+        // buffers the host reads or writes every step
+        let io = |n: usize| gpu.io_buffer(n * 4);
         let wide = ff.max(d).max(gw).max(aw);
         let s = Scratch {
             h: f4(TMAX * d),
@@ -331,15 +336,15 @@ impl Text {
             kp: f4(TMAX * kvw),
             vp: f4(TMAX * kvw),
             q: f4(TMAX * aw),
-            ids: f4(TMAX),
-            pos: f4(3 * TMAX),
+            ids: io(TMAX),
+            pos: io(3 * TMAX),
             logits: f4(logit_rows * cfg.vocab),
             pv: f4(logit_rows * ARGMAX_GROUPS),
             apart: f4(TMAX * cfg.heads * MAX_SPLITS * 258),
             pi: f4(logit_rows * ARGMAX_GROUPS),
-            out: f4(logit_rows),
-            dtok: f4(2),
-            dpos: f4(6),
+            out: io(logit_rows),
+            dtok: io(2),
+            dpos: io(6),
             v_qkv: f4(ng * VMAX * conv),
             v_qkvc: f4(ng * VMAX * conv),
             v_ab: f4(ng * VMAX * 2 * cfg.lin_v_heads),
@@ -399,10 +404,8 @@ impl Text {
     pub fn reset(&mut self) {
         self.state.len = 0;
         self.state.pos = 0;
-        unsafe {
-            std::ptr::write_bytes(contents::<u8>(&self.state.gdn), 0, self.n_gdn * self.cfg.gdn_state() * 4);
-            std::ptr::write_bytes(contents::<u8>(&self.state.conv), 0, self.n_gdn * self.cfg.conv_state() * 4);
-        }
+        gpu::zero(&self.state.gdn, self.n_gdn * self.cfg.gdn_state() * 4);
+        gpu::zero(&self.state.conv, self.n_gdn * self.cfg.conv_state() * 4);
     }
 
     /// Host access to the hidden input rows (for splicing image embeddings).
@@ -476,37 +479,89 @@ impl Text {
             ];
             return cmd.run("qmv4", &args, (l.o / 8, 1, 1), (64, 1, 1));
         }
-        // T >= 4: the LoRA up projection is added in each matmul's store (u rows of R floats, member i at i * r);
-        // T = 2, 3: by one lora_b pass after the group (qmvr's loop slows down with it inside)
-        let post = t > 3;
-        for (i, (l, y)) in ls.iter().enumerate() {
-            let lora = group.filter(|_| post).map(|(g, st)| (B(&st.lora.buf, g.b[i]), B(&st.u, i * g.r * 4), g.r, g.rows()));
-            self.qmm(cmd, wb, *l, x, *y, t, add, lora);
+        // Metal: fused shared-input kernels; Vulkan keeps per-matrix dispatches (gpu_vk maps them to qmm_cm)
+        #[cfg(target_os = "macos")]
+        {
+            // T = 2, 3: qmvr (decode math per row); verify batches: qmvxm, 8 rows per pass; prefill: qmm tiles
+            let (kernel, step) = match t {
+                2 | 3 => ("qmvr", t),
+                4..=16 => ("qmvxm", 8),
+                _ => ("qmm", t),
+            };
+            for c in (0..t).step_by(step) {
+                self.qmm_fused(kernel, cmd, wb, ls, x, c, (t - c).min(step), add, group);
+            }
         }
-        if let Some((g, st)) = group.filter(|_| !post) {
-            let lb = &st.lora.buf;
-            let mut args: Vec<Arg> = Vec::with_capacity(12);
-            let mut os = [0u32; 3];
-            for i in 0..3 {
-                let j = i.min(ls.len() - 1);
-                args.push(B(lb, g.b[j]).into());
-                args.push(ls[j].1.into());
-                if i < ls.len() {
-                    os[i] = ls[i].0.o as u32;
+        #[cfg(not(target_os = "macos"))]
+        {
+            // T >= 4: the LoRA up projection is added in each matmul's store (u rows of R floats, member i at i * r);
+            // T = 2, 3: by one lora_b pass after the group (qmvr's loop slows down with it inside)
+            let post = t > 3;
+            for (i, (l, y)) in ls.iter().enumerate() {
+                let lora = group.filter(|_| post).map(|(g, st)| (B(&st.lora.buf, g.b[i]), B(&st.u, i * g.r * 4), g.r, g.rows()));
+                self.qmm(cmd, wb, *l, x, *y, t, add, lora);
+            }
+            if let Some((g, st)) = group.filter(|_| !post) {
+                let lb = &st.lora.buf;
+                let mut args: Vec<Arg> = Vec::with_capacity(12);
+                let mut os = [0u32; 3];
+                for i in 0..3 {
+                    let j = i.min(ls.len() - 1);
+                    args.push(B(lb, g.b[j]).into());
+                    args.push(ls[j].1.into());
+                    if i < ls.len() {
+                        os[i] = ls[i].0.o as u32;
+                    }
                 }
+                args.push(B(&st.u, 0).into());
+                for o in os {
+                    args.push(o.into());
+                }
+                args.push((g.r as u32).into());
+                args.push((g.rows() as u32).into());
+                let total: u32 = os.iter().sum();
+                cmd.run("lora_b", &args, ((total as usize).div_ceil(256), t, 1), (256, 1, 1));
             }
-            args.push(B(&st.u, 0).into());
-            for o in os {
-                args.push(o.into());
+        }
+    }
+
+    /// Rows [c, c + t) of matmuls sharing input `x` in one dispatch of `kernel` (qmvr, qmvxm or qmm), with the LoRA
+    /// up projection of `group` in the store.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    fn qmm_fused(&self, kernel: &str, cmd: &mut Cmd, wb: &Buffer, ls: &[(Lin, B)], x: B, c: usize, t: usize, add: bool, group: Option<(&Group, &LoraState)>) {
+        let mut args: Vec<Arg> = Vec::with_capacity(22);
+        for i in 0..3 {
+            let (l, y) = ls[i.min(ls.len() - 1)];
+            args.extend([B(wb, l.w).into(), B(wb, l.s).into(), B(y.0, y.1 + c * l.o * 4).into()]);
+        }
+        let o = |i: usize| if i < ls.len() { ls[i].0.o } else { 0 };
+        let total: usize = ls.iter().map(|(l, _)| l.o).sum();
+        args.extend([B(x.0, x.1 + c * ls[0].0.k * 4).into(), (ls[0].0.k as u32).into(), (o(0) as u32).into(), (o(1) as u32).into()]);
+        args.extend([(total as u32).into(), (add as u32).into(), (t as u32).into()]);
+        match group {
+            Some((g, st)) => {
+                for i in 0..3 {
+                    args.push(B(&st.lora.buf, g.b[i.min(g.b.len() - 1)]).into());
+                }
+                args.extend([B(&st.u, c * g.rows() * 4).into(), (g.r as u32).into(), (g.rows() as u32).into()]);
             }
-            args.push((g.r as u32).into());
-            args.push((g.rows() as u32).into());
-            let total: u32 = os.iter().sum();
-            cmd.run("lora_b", &args, ((total as usize).div_ceil(256), t, 1), (256, 1, 1));
+            None => {
+                for _ in 0..4 {
+                    args.push(B(&self.s.xr, 0).into());
+                }
+                args.extend([0u32.into(), 0u32.into()]);
+            }
+        }
+        match kernel {
+            "qmvr" => cmd.run(kernel, &args, (total / 8, 1, 1), (64 * t, 1, 1)),
+            "qmvxm" => cmd.run(kernel, &args, (total / 32, 1, 1), (128, 1, 1)),
+            _ => cmd.run(kernel, &args, (total / 64, t.div_ceil(32), 1), (64, 1, 1)),
         }
     }
 
     /// T > 1 matmul y (+)= x W^T, plus the LoRA up projection (B, u, r, row stride of u) in the store.
+    #[cfg(not(target_os = "macos"))]
     #[allow(clippy::too_many_arguments)]
     fn qmm(&self, cmd: &mut Cmd, wb: &Buffer, l: Lin, x: B, y: B, t: usize, add: bool, lora: Option<(B, B, usize, usize)>) {
         assert!(t > 1, "t == 1 goes through qmm_lora");
@@ -934,9 +989,12 @@ impl Text {
         (0..n).map(|i| unsafe { *p.add(i) }).collect()
     }
 
-    pub fn logits(&self, row: usize) -> &[f32] {
+    pub fn logits(&self, row: usize) -> Vec<f32> {
         let v = self.cfg.vocab;
-        unsafe { std::slice::from_raw_parts(contents::<f32>(&self.s.logits).add(row * v), v) }
+        gpu::read(&self.s.logits, row * v * 4, v * 4)
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
     }
 
     /// Encodes one decode step that reads its token from ring slot `k % 2` and writes the next token to
@@ -1012,19 +1070,32 @@ impl Text {
 
     /// GPU copy of the whole state (used length of the KV cache only).
     pub fn encode_copy_state(&self, cmd: &mut Cmd, from: &State, to: &State) {
+        assert!(from.len <= to.cap);
         let f = 4usize;
         let c = &self.cfg;
         cmd.copy(B(&from.gdn, 0), B(&to.gdn, 0), self.n_gdn * c.gdn_state() * f);
         cmd.copy(B(&from.conv, 0), B(&to.conv, 0), self.n_gdn * c.conv_state() * f);
         let kvw = c.kv_width();
         for i in 0..self.n_attn {
-            let o = i * self.ctx * kvw * f;
             let n = from.len * kvw * f;
             if n > 0 {
-                cmd.copy(B(&from.kc, o), B(&to.kc, o), n);
-                cmd.copy(B(&from.vc, o), B(&to.vc, o), n);
+                cmd.copy(B(&from.kc, i * from.cap * kvw * f), B(&to.kc, i * to.cap * kvw * f), n);
+                cmd.copy(B(&from.vc, i * from.cap * kvw * f), B(&to.vc, i * to.cap * kvw * f), n);
             }
         }
+    }
+
+    /// A snapshot's buffers and their used bytes (GDN state, conv state, K, V), for saving and loading it with
+    /// `gpu::read` and `gpu::write`. Only while no GPU work writes `s`.
+    pub fn state_parts<'a>(&self, s: &'a State) -> [(&'a Buffer, usize); 4] {
+        let c = &self.cfg;
+        let kv = self.n_attn * s.cap * c.kv_width() * 4;
+        [
+            (&s.gdn, self.n_gdn * c.gdn_state() * 4),
+            (&s.conv, self.n_gdn * c.conv_state() * 4),
+            (&s.kc, kv),
+            (&s.vc, kv),
+        ]
     }
 }
 

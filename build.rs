@@ -8,11 +8,14 @@ fn main() {
 
     let apple = macos_arm && feature("APPLE");
     let bonsai_metal = macos_arm && feature("BONSAI");
+    let bonsai_vulkan = target_os == "windows" && feature("BONSAI");
 
     // Named cfgs so source files can gate on capabilities instead of
     // repeating feature and target predicates.
     emit_cfg("apple_model", apple);
     emit_cfg("bonsai_metal", bonsai_metal);
+    emit_cfg("bonsai_vulkan", bonsai_vulkan);
+    emit_cfg("bonsai_backend", bonsai_metal || bonsai_vulkan);
 
     if apple {
         println!("cargo::rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
@@ -24,6 +27,10 @@ fn main() {
 
     if bonsai_metal {
         compile_metal_kernels();
+    }
+
+    if bonsai_vulkan {
+        compile_vulkan_kernels();
     }
 }
 
@@ -117,4 +124,47 @@ fn compile_metal_kernels() {
         .status()
         .expect("failed to run xcrun metallib");
     assert!(status.success(), "metallib failed for {source}");
+}
+
+/// Compiles src/bonsai/runtime/kernels/*.comp to SPIR-V with glslc (Vulkan SDK) and writes a table the runtime
+/// embeds, so the app never compiles shaders.
+fn compile_vulkan_kernels() {
+    let dir = PathBuf::from("src/bonsai/runtime/kernels");
+    println!("cargo::rerun-if-changed={}", dir.display());
+    println!("cargo::rerun-if-env-changed=VULKAN_SDK");
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let glslc = std::env::var_os("VULKAN_SDK")
+        .map(|sdk| PathBuf::from(sdk).join("Bin").join("glslc.exe"))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("glslc"));
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| {
+            let p = e.unwrap().path();
+            (p.extension()? == "comp").then(|| p.file_stem().unwrap().to_string_lossy().into_owned())
+        })
+        .collect();
+    names.sort();
+    let mut table = String::from("pub static SPV: &[(&str, &[u8])] = &[\n");
+    let mut all = Vec::new();
+    for name in &names {
+        let src = dir.join(format!("{name}.comp"));
+        let spv = out_dir.join(format!("{name}.spv"));
+        let status = Command::new(&glslc)
+            .args(["--target-env=vulkan1.3", "-O", "-o"])
+            .arg(&spv)
+            .arg(&src)
+            .status()
+            .unwrap_or_else(|e| {
+                panic!("the bonsai feature needs glslc from the Vulkan SDK to compile its kernels ({e}); set VULKAN_SDK")
+            });
+        assert!(status.success(), "glslc failed for {}", src.display());
+        all.extend(std::fs::read(&spv).unwrap());
+        table.push_str(&format!("    (\"{name}\", include_bytes!(r\"{}\")),\n", spv.display()));
+    }
+    table.push_str("];\n");
+    let all_path = out_dir.join("kernels.spvall");
+    std::fs::write(&all_path, all).unwrap();
+    table.push_str(&format!("pub static ALL: &[u8] = include_bytes!(r\"{}\");\n", all_path.display()));
+    std::fs::write(out_dir.join("kernels_spv.rs"), table).unwrap();
 }

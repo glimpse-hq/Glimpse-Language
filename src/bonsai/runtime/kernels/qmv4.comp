@@ -1,0 +1,9 @@
+#version 460
+#include "common.glsl"
+#include "qmv.glsl"
+// Decode matvec (one token), 2 subgroups x 4 rows per workgroup, optional LoRA epilogue. Grid O / 8.
+layout(local_size_x = 64) in;
+layout(push_constant) uniform P { PTR W; PTR S; PTR x; PTR y; uint K; uint O; uint add; PTR B; PTR u; uint lr; } pc;
+void main() {
+    qmv_rows4(pc.W, pc.S, pc.x, 0u, pc.y, 0u, pc.K, (gl_WorkGroupID.x * 2u + SID) * 4u, pc.add, pc.B, pc.u, 0u, pc.lr);
+}

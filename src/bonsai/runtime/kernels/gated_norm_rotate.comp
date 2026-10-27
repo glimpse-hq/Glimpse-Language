@@ -1,0 +1,37 @@
+#version 460
+#include "common.glsl"
+// GDN output: per head (128) rmsnorm(y) * w * silu(z), then rotate. W = v heads * 128 (multiple of 512).
+layout(local_size_x = 128) in;
+layout(push_constant) uniform P { PTR y; PTR zg; PTR w; PTR signs; PTR xr; uint W; PTR A; PTR U; uint R; } pc;
+shared float red[16];
+shared float lred[16];
+#include "rot.glsl"
+
+// Head output for the 4 values at k (one subgroup covers a 128-wide head).
+vec4 gated4(uint o, uint k) {
+    vec4 v = f4(pc.y, o + k);
+    float r = inversesqrt(subgroupAdd(dot(v, v)) / 128.0 + EPS);
+    return silu4(f4(pc.zg, o + k)) * (v * r * f4(pc.w, k & 127u));
+}
+
+void main() {
+    uint W = pc.W, K = W, t = gl_WorkGroupID.x, nch = (W + CHUNK - 1u) / CHUNK;
+    uint o = t * W;
+    LORA_ROW(nch, gated4(o, k))
+    uint b0 = gl_WorkGroupID.y * CHUNK + SID * 512u;
+    if (b0 >= W) return;
+    uint c0 = b0 + LANE;
+    float rh[4];
+    [[unroll]] for (uint hh = 0u; hh < 4u; hh++) {
+        vec4 yh = f4(pc.y, o + b0 + hh * 128u + LANE * 4u);
+        rh[hh] = inversesqrt(subgroupAdd(dot(yh, yh)) / 128.0 + EPS);
+    }
+    float v[16];
+    [[unroll]] for (uint i = 0u; i < 16u; i++) {
+        uint e = c0 + 32u * i;
+        float a = Fp(pc.zg).v[o + e];
+        v[i] = ((((a * Fp(pc.y).v[o + e]) * rh[i / 4u]) * Fp(pc.w).v[e & 127u]) * (1.0 / (1.0 + exp(-a)))) * Fp(pc.signs).v[e];
+    }
+    fwht512(v);
+    [[unroll]] for (uint i = 0u; i < 16u; i++) Fp(pc.xr).v[o + c0 + 32u * i] = v[i] * INV_SQRT512;
+}

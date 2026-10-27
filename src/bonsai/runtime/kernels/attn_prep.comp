@@ -1,0 +1,59 @@
+#version 460
+#include "common.glsl"
+// Attention prep: q/k rmsnorm (weights), interleaved mrope on the first ROT dims (sections s1, s2 for the h and w
+// rows, the rest t), KV cache write. Grid (T, H + 2 KV): heads [0, H) q, then KV k heads, then KV v heads.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    PTR qp; PTR kp; PTR vp; PTR qn; PTR kn; PTR pos; PTR inv_freq; PTR qout; PTR kc; PTR vc;
+    uint T; uint off_; uint H; uint KV; uint ROT; uint s1; uint s2; uint threads; PTR dyn;
+} pc;
+shared float red[8];
+shared float buf[256];
+
+// sin and cos to about 1 ulp for the large angles of late positions (Cody-Waite reduction by pi / 2, Cephes
+// polynomials); the builtins lose accuracy there on some GPUs.
+void sincos_precise(float x, out float s, out float c) {
+    float k = round(x * 0.6366197723675814);
+    float r = fma(-k, 1.5707963705062866, x);
+    r = fma(-k, -4.371139000186241e-08, r);
+    float r2 = r * r;
+    float sr = r + r * r2 * (-1.6666654611e-1 + r2 * (8.3321608736e-3 + r2 * -1.9515295891e-4));
+    float cr = 1.0 - 0.5 * r2 + r2 * r2 * (4.166664568298827e-2 + r2 * (-1.388731625493765e-3 + r2 * 2.443315711809948e-5));
+    int q = int(k) & 3;
+    if (q == 0) { s = sr; c = cr; }
+    else if (q == 1) { s = cr; c = -sr; }
+    else if (q == 2) { s = -sr; c = -cr; }
+    else { s = -cr; c = sr; }
+}
+
+void main() {
+    uint t = gl_WorkGroupID.x, hh = gl_WorkGroupID.y, d = gl_LocalInvocationIndex;
+    uint H = pc.H, KV = pc.KV;
+    // per-step KV offset from the parameter slot in cached command buffers
+    uint off = pc.dyn != uvec2(0u) ? Up(pc.dyn).v[0] : pc.off_;
+    if (hh >= H + KV) {
+        uint kh = hh - H - KV;
+        Fp(pc.vc).v[((off + t) * KV + kh) * 256u + d] = Fp(pc.vp).v[t * KV * 256u + kh * 256u + d];
+        return;
+    }
+    bool isq = hh < H;
+    float x = isq ? Fp(pc.qp).v[t * H * 512u + hh * 512u + d] : Fp(pc.kp).v[t * KV * 256u + (hh - H) * 256u + d];
+    float s = subgroupAdd(x * x);
+    if (LANE == 0u) red[SID] = s;
+    barrier();
+    float r = inversesqrt(subgroupAdd(LANE < 8u ? red[LANE] : 0.0) / 256.0 + EPS);
+    x = x * r * (isq ? Fp(pc.qn).v[d] : Fp(pc.kn).v[d]);
+    buf[d] = x;
+    barrier();
+    if (d < pc.ROT) {
+        uint half_ = pc.ROT / 2u;
+        uint i = d % half_;
+        uint sel = (i % 3u == 1u && i < 3u * pc.s1) ? 1u : ((i % 3u == 2u && i < 3u * pc.s2) ? 2u : 0u);
+        float ang = float(Ip(pc.pos).v[sel * pc.T + t]) * Fp(pc.inv_freq).v[i];
+        float sn, cs;
+        sincos_precise(ang, sn, cs);
+        x = d < half_ ? x * cs - buf[d + half_] * sn : x * cs + buf[d - half_] * sn;
+    }
+    if (isq) Fp(pc.qout).v[(t * H + hh) * 256u + d] = x;
+    else Fp(pc.kc).v[((off + t) * KV + (hh - H)) * 256u + d] = x;
+}

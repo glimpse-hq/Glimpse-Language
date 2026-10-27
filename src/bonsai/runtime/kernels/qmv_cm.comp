@@ -1,0 +1,126 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#define CM_TILES
+#include "common.glsl"
+// Verify matmul (T <= 16) on cooperative matrices, same math as qmm_cm (fp16 weights exact, activations split
+// into fp16 hi + lo, fp32 accumulation, LoRA as extra k steps). Each workgroup covers 128 rows (4 subgroups x 32)
+// per activation tile, so each tile's conversion serves twice the rows of qmm_cm. Grid (O / 128, 1, split);
+// slice z sums its k range into part[z][T][O] (qmm_reduce adds them) or, unsplit, writes Y directly.
+layout(local_size_x = 128) in;
+layout(push_constant) uniform P {
+    PTR W; PTR S; PTR X; PTR Y; uint K; uint O; uint add; uint T; PTR Bm; PTR u; uint lr; uint UR; PTR part; uint kslice;
+} pc;
+
+const uint KS = 64u;
+const uint XS = KS + 8u;       // row stride in halves
+const uint X4 = XS / 8u;       // in uvec4 (16-byte stores spread over all banks)
+shared uvec4 xh[16 * X4];
+shared uvec4 xl[16 * X4];
+shared uvec4 ws[128 * X4];     // weights (128 rows); after the loop, the output tile [16][128] as float bits
+
+#define CM_A coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define CM_B coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define CM_C coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    uint n0 = gl_WorkGroupID.x * 128u, z = gl_WorkGroupID.z;
+    uint K = pc.K, kw = K / 16u, kg = K / 128u, T = pc.T;
+    uint kbeg = z * pc.kslice;
+    uint nbase = (min(K, kbeg + pc.kslice) - kbeg) / KS;
+    uint ntiles = nbase + (z == 0u ? (pc.lr + KS - 1u) / KS : 0u);
+    #define KAT(i) ((i) < nbase ? kbeg + (i) * KS : K + ((i) - nbase) * KS)
+    CM_C acc[2];
+    acc[0] = CM_C(0.0);
+    acc[1] = CM_C(0.0);
+    // activation loader: token xr (16 tokens x 8 threads), 16 values from xc; weight loader: one row, 8 words
+    uint xr = tid / 4u, xc = (tid % 4u) * 16u;
+    bool xon = xr < T && xr < 16u;
+    vec4 xv[4];
+    uvec4 wa = uvec4(0u);
+    float wsc = 0.0;
+    uint row = n0 + tid;
+    #define LOAD(k)                                                                                     \
+        {                                                                                               \
+            if ((k) < K) {                                                                              \
+                if (xon) {                                                                              \
+                    uint o = xr * K + (k) + xc;                                                         \
+                    [[unroll]] for (uint p = 0u; p < 4u; p++) xv[p] = f4(pc.X, o + 4u * p);             \
+                }                                                                                       \
+                wa = U4p(pc.W).v[(row * kw + (k) / 16u) >> 2];                                          \
+                wsc = half_at(pc.S, row * kg + (k) / 128u);                                             \
+            } else {                                                                                    \
+                [[unroll]] for (uint p = 0u; p < 4u; p++) {                                             \
+                    float t4[4];                                                                        \
+                    [[unroll]] for (uint e = 0u; e < 4u; e++) {                                         \
+                        uint j = (k) - K + xc + 4u * p + e;                                             \
+                        t4[e] = xon && j < pc.lr ? Fp(pc.u).v[xr * pc.UR + j] : 0.0;                    \
+                    }                                                                                   \
+                    xv[p] = vec4(t4[0], t4[1], t4[2], t4[3]);                                           \
+                }                                                                                       \
+            }                                                                                           \
+        }
+    LOAD(KAT(0u))
+    for (uint it = 0u; it < ntiles; it++) {
+        uint k0 = KAT(it);
+        bool lora = k0 >= K;
+        barrier();
+        if (xr < 16u) {
+            uvec4 h0, h1, l0, l1;
+            split16(xon ? xv[0] : vec4(0.0), xon ? xv[1] : vec4(0.0), xon ? xv[2] : vec4(0.0), xon ? xv[3] : vec4(0.0), h0, h1, l0, l1);
+            uint o = xr * X4 + xc / 8u;
+            xh[o] = h0; xh[o + 1u] = h1; xl[o] = l0; xl[o + 1u] = l1;
+        }
+        if (!lora) {
+            uint w8[4] = uint[4](wa.x, wa.y, wa.z, wa.w);
+            float16_t s16 = float16_t(wsc);
+            [[unroll]] for (uint q = 0u; q < 4u; q++) {
+                uint p[8];
+                decode_word(w8[q], s16, p);
+                ws[tid * X4 + q * 2u] = uvec4(p[0], p[1], p[2], p[3]);
+                ws[tid * X4 + q * 2u + 1u] = uvec4(p[4], p[5], p[6], p[7]);
+            }
+        } else {
+            [[unroll]] for (uint q = 0u; q < 4u; q++) {
+                uvec4 p0, p1;
+                pack16_half(pc.Bm, row * pc.lr, (k0 - K) + q * 16u, pc.lr, p0, p1);
+                ws[tid * X4 + q * 2u] = p0;
+                ws[tid * X4 + q * 2u + 1u] = p1;
+            }
+        }
+        barrier();
+        if (it + 1u < ntiles) LOAD(KAT(it + 1u))
+        uint kn = lora ? min(KS, (pc.lr - (k0 - K) + 15u) / 16u * 16u) : KS;
+        [[unroll]] for (uint kk = 0u; kk < KS; kk += 16u) {
+            if (kk < kn) {
+                CM_A ah, al;
+                coopMatLoad(ah, xh, kk / 8u, X4, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(al, xl, kk / 8u, X4, gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (uint i = 0u; i < 2u; i++) {
+                    CM_B b;
+                    coopMatLoad(b, ws, ((SID * 32u + i * 16u) * XS + kk) / 8u, X4, gl_CooperativeMatrixLayoutColumnMajor);
+                    acc[i] = coopMatMulAdd(ah, b, acc[i]);
+                    acc[i] = coopMatMulAdd(al, b, acc[i]);
+                }
+            }
+        }
+    }
+    barrier();
+    // output tile [16 tokens][128 rows] fp32 in the weight tile's space (2304 uvec4 >= 512 needed)
+    [[unroll]] for (uint i = 0u; i < 2u; i++)
+        coopMatStore(acc[i], ws, (SID * 32u + i * 16u) / 4u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    bool split = gl_NumWorkGroups.z > 1u;
+    for (uint e = tid; e < T * 128u; e += 128u) {
+        uint tt = e / 128u, n = n0 + e % 128u;
+        float v = uintBitsToFloat(ws[e / 4u][e % 4u]);
+        if (split) {
+            Fp(pc.part).v[(z * T + tt) * pc.O + n] = v;
+        } else {
+            uint yi = tt * pc.O + n;
+            Fp(pc.Y).v[yi] = pc.add != 0u ? Fp(pc.Y).v[yi] + v : v;
+        }
+    }
+}

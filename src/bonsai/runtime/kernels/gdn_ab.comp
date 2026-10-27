@@ -1,0 +1,10 @@
+#version 460
+#include "common.glsl"
+#include "qmv.glsl"
+// Dense fp32 matvec for the GDN a/b projections: out[t, 0..NV) = Wa x, out[t, NV..2NV) = Wb x. One subgroup per
+// row, grid (2 NV / 4, T).
+layout(local_size_x = 128) in;
+layout(push_constant) uniform P { PTR Wa; PTR Wb; PTR x; PTR out_; uint NV; uint K; } pc;
+void main() {
+    gdn_ab_row(pc.Wa, pc.Wb, pc.x, pc.out_, pc.NV, pc.K, gl_WorkGroupID.x * 4u + SID, gl_WorkGroupID.y);
+}

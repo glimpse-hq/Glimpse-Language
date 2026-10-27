@@ -1,0 +1,11 @@
+#version 460
+#include "common.glsl"
+#include "qmv.glsl"
+// Small-T matvec (T <= 3): one subgroup pair per token in the same workgroup, so the copies share weight reads.
+layout(local_size_x = 192) in;
+layout(push_constant) uniform P { PTR W; PTR S; PTR X; PTR Y; uint K; uint O; uint add; uint T; } pc;
+void main() {
+    uint t = SID / 2u;
+    if (t >= pc.T) return;
+    qmv_rows4(pc.W, pc.S, pc.X, t * pc.K, pc.Y, t * pc.O, pc.K, (gl_WorkGroupID.x * 2u + SID % 2u) * 4u, pc.add, pc.S, pc.X, 0u, 0u);
+}

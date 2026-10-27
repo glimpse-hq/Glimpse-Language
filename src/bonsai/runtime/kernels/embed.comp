@@ -1,0 +1,23 @@
+#version 460
+#include "common.glsl"
+// Embedding: row = (code - 1) * scale (fp16), inverse transform: fwht then * signs, rounded to fp16.
+// Grid (T, ceil(D / CHUNK)).
+layout(local_size_x = 128) in;
+layout(push_constant) uniform P { PTR W; PTR S; PTR signs; PTR ids; PTR out_; uint D; } pc;
+
+void main() {
+    uint D = pc.D, t = gl_WorkGroupID.x, c0 = gl_WorkGroupID.y * CHUNK + SID * 512u + LANE;
+    if (c0 >= D) return;
+    uint row = uint(Ip(pc.ids).v[t]);
+    uint kw = D / 16u, kg = D / 128u;
+    float v[16];
+    [[unroll]] for (uint i = 0u; i < 16u; i++) {
+        uint k = c0 + 32u * i;
+        uint wd = Up(pc.W).v[row * kw + (k >> 4)];
+        float c = float((wd >> (2u * (k & 15u))) & 3u) - 1.0;
+        v[i] = round_half(c * half_at(pc.S, row * kg + (k >> 7)));
+    }
+    fwht512(v);
+    [[unroll]] for (uint i = 0u; i < 16u; i++)
+        Fp(pc.out_).v[t * D + c0 + 32u * i] = round_half(v[i] * INV_SQRT512 * Fp(pc.signs).v[c0 + 32u * i]);
+}

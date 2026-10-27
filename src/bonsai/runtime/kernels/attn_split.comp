@@ -1,0 +1,58 @@
+#version 460
+#include "common.glsl"
+// Split-K causal attention. Workgroup = (kv head, key chunk, query t); the 4 q heads of that kv head share each
+// K/V read. Writes per-chunk partials (max, sum, acc[256]) to part[(t * H + h) * nsplit + s].
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P { PTR q; PTR kc; PTR vc; PTR part; uint off_; uint chunk; uint nsplit_; uint H; uint KV; uint threads; PTR dyn; } pc;
+shared float sc[4 * 512];
+shared float ml[8];
+void main() {
+    uint kh = gl_WorkGroupID.x, s = gl_WorkGroupID.y, t = gl_WorkGroupID.z, tid = gl_LocalInvocationIndex;
+    uint H = pc.H, KV = pc.KV;
+    // per-step KV offset and split count from the parameter slot in cached command buffers
+    bool d = pc.dyn != uvec2(0u);
+    uint off = d ? Up(pc.dyn).v[0] : pc.off_, ns = d ? Up(pc.dyn).v[1] : pc.nsplit_;
+    uint n = off + t + 1u;
+    uint j0 = s * pc.chunk, j1 = min(n, j0 + pc.chunk);
+    uint pp = ((t * H + kh * 4u) * ns + s) * 258u;
+    if (j0 >= j1) {
+        if (tid < 4u) { Fp(pc.part).v[pp + tid * ns * 258u] = NEG_INF; Fp(pc.part).v[pp + tid * ns * 258u + 1u] = 0.0; }
+        return;
+    }
+    vec4 qa[4], qb[4];
+    [[unroll]] for (uint h = 0u; h < 4u; h++) {
+        uint qo = (t * H + kh * 4u + h) * 256u + LANE * 8u;
+        qa[h] = f4(pc.q, qo) * 0.0625;
+        qb[h] = f4(pc.q, qo + 4u) * 0.0625;
+    }
+    for (uint j = j0 + SID; j < j1; j += 8u) {
+        uint ko = (j * KV + kh) * 256u + LANE * 8u;
+        vec4 ka = f4(pc.kc, ko), kb = f4(pc.kc, ko + 4u);
+        [[unroll]] for (uint h = 0u; h < 4u; h++) {
+            float d = subgroupAdd(dot(qa[h], ka) + dot(qb[h], kb));
+            if (LANE == 0u) sc[h * 512u + (j - j0)] = d;
+        }
+    }
+    barrier();
+    uint cnt = j1 - j0;
+    if (SID < 4u) {
+        float m = NEG_INF;
+        for (uint i = LANE; i < cnt; i += 32u) m = max(m, sc[SID * 512u + i]);
+        m = subgroupMax(m);
+        float l = 0.0;
+        for (uint i = LANE; i < cnt; i += 32u) { float p = exp(sc[SID * 512u + i] - m); sc[SID * 512u + i] = p; l += p; }
+        l = subgroupAdd(l);
+        if (LANE == 0u) { ml[SID * 2u] = m; ml[SID * 2u + 1u] = l; }
+    }
+    barrier();
+    float acc[4] = float[4](0.0, 0.0, 0.0, 0.0);
+    for (uint i = 0u; i < cnt; i++) {
+        float v = Fp(pc.vc).v[((j0 + i) * KV + kh) * 256u + tid];
+        [[unroll]] for (uint h = 0u; h < 4u; h++) acc[h] += sc[h * 512u + i] * v;
+    }
+    [[unroll]] for (uint h = 0u; h < 4u; h++) {
+        uint ph = pp + h * ns * 258u;
+        if (tid == 0u) { Fp(pc.part).v[ph] = ml[h * 2u]; Fp(pc.part).v[ph + 1u] = ml[h * 2u + 1u]; }
+        Fp(pc.part).v[ph + 2u + tid] = acc[h];
+    }
+}

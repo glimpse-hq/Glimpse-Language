@@ -1,12 +1,15 @@
-//! The public API over the Metal runtime: one model behind a mutex, idle release, panics turned into
-//! errors.
+//! The public API over the runtime (Metal or Vulkan): one model behind a mutex, idle release, panics turned
+//! into errors.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard};
+#[cfg(bonsai_metal)]
+use std::sync::OnceLock;
 use std::time::Duration;
 
+#[cfg(bonsai_metal)]
 use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily};
 
 use super::runtime::Model;
@@ -16,6 +19,18 @@ use super::{
     StopReason,
 };
 
+/// Saved system prompt states, inside the model directory.
+const PREFIX_DIR: &str = "prefix-cache";
+
+#[cfg(bonsai_vulkan)]
+pub fn availability() -> Availability {
+    match super::runtime::gpu::available() {
+        Ok(_) => Availability::Available,
+        Err(_) => Availability::Unsupported,
+    }
+}
+
+#[cfg(bonsai_metal)]
 pub fn availability() -> Availability {
     static AVAILABILITY: OnceLock<Availability> = OnceLock::new();
     *AVAILABILITY.get_or_init(|| {
@@ -31,6 +46,7 @@ pub fn availability() -> Availability {
     })
 }
 
+#[cfg(bonsai_metal)]
 fn macos_major() -> u32 {
     let mut buf = [0u8; 32];
     let mut len = buf.len();
@@ -65,16 +81,20 @@ pub struct Handle {
     state: Mutex<State>,
 }
 
-// Metal objects are thread safe, and the mutex serializes every use of the model.
+// GPU objects are used only under the mutex, which serializes every use of the model.
 unsafe impl Send for State {}
 
 impl Handle {
     pub fn load(dir: &Path, adapter: Option<&Path>) -> Result<Handle, BonsaiError> {
         if availability() != Availability::Available {
-            return Err(BonsaiError::new(
-                BonsaiErrorKind::Unsupported,
-                "Bonsai needs an Apple Silicon Mac with macOS 14 or later",
-            ));
+            #[cfg(bonsai_metal)]
+            let message = "Bonsai needs an Apple Silicon Mac with macOS 14 or later".to_string();
+            #[cfg(bonsai_vulkan)]
+            let message = format!(
+                "Bonsai needs a Vulkan 1.3 GPU ({})",
+                super::runtime::gpu::available().err().unwrap_or_default()
+            );
+            return Err(BonsaiError::new(BonsaiErrorKind::Unsupported, message));
         }
         let model = load_model(dir, adapter)?;
         Ok(Handle {
@@ -183,6 +203,7 @@ impl Handle {
 fn load_model(dir: &Path, adapter: Option<&Path>) -> Result<Model, BonsaiError> {
     guarded(|| {
         let mut model = Model::load(dir, CONTEXT)?;
+        model.prefix_dir = Some(dir.join(PREFIX_DIR));
         if adapter.is_some() {
             model.set_lora(adapter, 1.0)?;
         }

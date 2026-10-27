@@ -1,0 +1,41 @@
+#version 460
+#include "common.glsl"
+#include "qmv.glsl"
+// Prefill matmul Y[T, O] (+)= X[T, K] W[O, K]^T, 32 tokens x 64 rows per workgroup, K step 32. Each thread owns
+// 4 tokens x 4 rows. Grid (O / 64, ceil(T / 32)). LoRA up projection in the store.
+layout(local_size_x = 128) in;
+layout(push_constant) uniform P { PTR W; PTR S; PTR X; PTR Y; uint K; uint O; uint add; uint T; PTR Bm; PTR u; uint lr; uint UR; } pc;
+shared float xs[32 * 33];
+shared float ws[64 * 33];
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    uint n0 = gl_WorkGroupID.x * 64u, t0 = gl_WorkGroupID.y * 32u;
+    uint K = pc.K, kw = K / 16u, kg = K / 128u;
+    uint xr = tid / 4u, xc = (tid % 4u) * 8u;
+    uint wr = tid / 2u, wq = tid % 2u;
+    uint rl = tid % 16u, tl = tid / 16u;
+    float acc[4][4];
+    [[unroll]] for (uint i = 0u; i < 4u; i++) [[unroll]] for (uint j = 0u; j < 4u; j++) acc[i][j] = 0.0;
+    for (uint k0 = 0u; k0 < K; k0 += 32u) {
+        barrier();
+        uint tt = t0 + xr;
+        vec4 a = vec4(0.0), b = vec4(0.0);
+        if (tt < pc.T) { a = f4(pc.X, tt * K + k0 + xc); b = f4(pc.X, tt * K + k0 + xc + 4u); }
+        [[unroll]] for (uint e = 0u; e < 4u; e++) { xs[xr * 33u + xc + e] = a[e]; xs[xr * 33u + xc + 4u + e] = b[e]; }
+        uint row = n0 + wr;
+        uint wd = Up(pc.W).v[row * kw + k0 / 16u + wq];
+        float sc = half_at(pc.S, row * kg + k0 / 128u);
+        [[unroll]] for (uint e = 0u; e < 16u; e++) ws[wr * 33u + wq * 16u + e] = (float((wd >> (2u * e)) & 3u) - 1.0) * sc;
+        barrier();
+        [[unroll]] for (uint kk = 0u; kk < 32u; kk++) {
+            float xv[4], wv[4];
+            [[unroll]] for (uint j = 0u; j < 4u; j++) xv[j] = xs[(tl + 8u * j) * 33u + kk];
+            [[unroll]] for (uint i = 0u; i < 4u; i++) wv[i] = ws[(rl + 16u * i) * 33u + kk];
+            [[unroll]] for (uint i = 0u; i < 4u; i++) [[unroll]] for (uint j = 0u; j < 4u; j++) acc[i][j] += xv[j] * wv[i];
+        }
+    }
+    [[unroll]] for (uint i = 0u; i < 4u; i++) [[unroll]] for (uint j = 0u; j < 4u; j++) {
+        uint tt = t0 + tl + 8u * j, n = n0 + rl + 16u * i;
+        if (tt < pc.T) store_post(pc.Y, tt * pc.O + n, acc[i][j], pc.add, pc.Bm, n * pc.lr, pc.u, tt * pc.UR, pc.lr);
+    }
+}

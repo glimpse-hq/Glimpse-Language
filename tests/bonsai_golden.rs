@@ -28,6 +28,9 @@ fn split_prompt(prompt: &str) -> (&str, &str) {
 #[ignore = "needs BONSAI_MODEL_DIR"]
 fn matches_mlx_golden_outputs() {
     let dir = PathBuf::from(std::env::var("BONSAI_MODEL_DIR").expect("set BONSAI_MODEL_DIR"));
+    // Saved prompt states from earlier runs would make the cold runs warm.
+    let saved = dir.join("prefix-cache");
+    let _ = std::fs::remove_dir_all(&saved);
     let model = Bonsai::load(&dir, None).expect("load");
     let set = match model.info().size {
         ModelSize::B2 => "2b",
@@ -70,20 +73,44 @@ fn matches_mlx_golden_outputs() {
         }
     }
 
-    // Idle release keeps working output.
+    // Idle release keeps working output and the cached prompt states.
     model.release_idle();
     assert!(model.is_idle());
     let json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&cases[0]).unwrap()).unwrap();
     let (system, user) = split_prompt(json["prompt_text"].as_str().unwrap());
+    let expected = json["generated_text_until_eos"].as_str().unwrap().trim();
     let out = model
         .generate(system, user, &GenerateOptions::default(), None)
         .unwrap();
     assert!(!model.is_idle());
-    assert_eq!(
-        out.text,
-        json["generated_text_until_eos"].as_str().unwrap().trim()
-    );
+    assert_eq!(out.text, expected);
+
+    // A new load restores the saved prompt states (written in the background).
+    let saved_any = || {
+        std::fs::read_dir(&saved)
+            .is_ok_and(|d| d.flatten().any(|e| e.path().extension().is_some_and(|x| x == "prefix")))
+    };
+    for _ in 0..100 {
+        if saved_any() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(saved_any(), "no prompt state saved");
+    for case in &cases {
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(case).unwrap()).unwrap();
+        let (system, user) = split_prompt(json["prompt_text"].as_str().unwrap());
+        let expected = json["generated_text_until_eos"].as_str().unwrap().trim();
+        let fresh = Bonsai::load(&dir, None).expect("load");
+        let out = fresh
+            .generate(system, user, &GenerateOptions::default(), None)
+            .unwrap();
+        if out.text != expected {
+            failures.push(format!("{} (saved state): {:?}", case.display(), out.text));
+        }
+    }
 
     let cancel = AtomicBool::new(true);
     let err = model
