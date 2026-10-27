@@ -9,16 +9,15 @@ description = "Fast on-device language models for macOS and Windows"
 license = "MIT"
 repository = "https://github.com/glimpse-hq/Glimpse-Language"
 homepage = "https://github.com/glimpse-hq/Glimpse-Language"
-documentation = "https://docs.rs/glimpse-language"
 
 [features]
 default = []
-apple = ["dep:serde"]
-bonsai = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal", "dep:dispatch2", "dep:libc", "dep:half", "dep:regex", "dep:image", "dep:ash"]
+apple = ["dep:serde", "dep:serde_json"]
+bonsai = ["dep:serde_json", "dep:objc2", "dep:objc2-foundation", "dep:objc2-metal", "dep:dispatch2", "dep:libc", "dep:half", "dep:regex", "dep:image", "dep:ash"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
-serde_json = "1"
+serde_json = { version = "1", optional = true }
 half = { version = "2", default-features = false, optional = true }
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"], optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }

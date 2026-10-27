@@ -1,4 +1,4 @@
-//! Glimpse-Language additions that need the runtime's private items. Ours, not synced from bonsai-ane.
+//! Glimpse-Language additions that need the runtime's private items. Ours, not synced from Glimpse-Lab.
 
 use super::gpu::Gpu;
 use super::model::{Config, Text, VMAX};

@@ -16,8 +16,9 @@ mod handle;
 #[rustfmt::skip]
 mod runtime;
 
-/// Files a model directory must contain, the same on macOS and Windows: PrismML's MLX 2-bit pack. The runtime
-/// also writes `tokenizer.bonsai` (a parsed tokenizer cache, 6.8 MB) next to them when the directory is writable.
+/// Files a model directory must contain, the same on macOS and Windows: PrismML's MLX 2-bit pack, with or without
+/// its vision tensors. The runtime also writes `tokenizer.bonsai` (a parsed tokenizer cache, 6.8 MB) next to them
+/// when the directory is writable.
 pub const MODEL_FILES: [&str; 3] = ["model.safetensors", "config.json", "tokenizer.json"];
 
 /// Positions in the KV cache: system prompt, user turn and output together.
@@ -218,7 +219,7 @@ enum Never {}
 
 impl Bonsai {
     /// Maps (Metal, about 25 ms warm) or uploads (Vulkan, 0.4 to 1 s warm) the weights and builds the GPU
-    /// state. `adapter` is a LoRA safetensors file: bonsai/train.py's export, or a PEFT
+    /// state. `adapter` is a LoRA safetensors file: Glimpse-Lab's export (alpha / r folded into B), or a PEFT
     /// `adapter_model.safetensors` with its `adapter_config.json` beside it. On Vulkan the first load on a
     /// machine (or after a driver update) also builds the GPU pipelines, about 2 s more.
     pub fn load(model_dir: &Path, adapter: Option<&Path>) -> Result<Bonsai, BonsaiError> {

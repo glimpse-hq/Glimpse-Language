@@ -1,6 +1,6 @@
 //! LoRA adapters applied at load time next to the unchanged ternary base:
 //! y = base(x) + (x @ A.T) @ B.T on each packed linear's ordinary (unrotated) input, fp16 A and B.
-//! Accepts bonsai/train.py's export_coreml file (`model.layers.N.<mod>.lora_A` [r, in], `.lora_B` [out, r],
+//! Accepts Glimpse-Lab's export (g1/bonsai/train.py `export_coreml`: `model.layers.N.<mod>.lora_A` [r, in], `.lora_B` [out, r],
 //! alpha / r already in B) and PEFT adapters (`...layers.N.<mod>.lora_A.weight`, alpha / r from the
 //! adapter_config.json next to the file). A of linears that share an input are stacked into one matrix.
 
