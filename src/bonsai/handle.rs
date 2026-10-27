@@ -87,14 +87,14 @@ unsafe impl Send for State {}
 impl Handle {
     pub fn load(dir: &Path, adapter: Option<&Path>) -> Result<Handle, BonsaiError> {
         if availability() != Availability::Available {
-            return Err(BonsaiError::new(
-                BonsaiErrorKind::Unsupported,
-                if cfg!(bonsai_metal) {
-                    "Bonsai needs an Apple Silicon Mac with macOS 14 or later"
-                } else {
-                    "Bonsai needs a Vulkan 1.3 GPU"
-                },
-            ));
+            #[cfg(bonsai_metal)]
+            let message = "Bonsai needs an Apple Silicon Mac with macOS 14 or later".to_string();
+            #[cfg(bonsai_vulkan)]
+            let message = format!(
+                "Bonsai needs a Vulkan 1.3 GPU ({})",
+                super::runtime::gpu::available().err().unwrap_or_default()
+            );
+            return Err(BonsaiError::new(BonsaiErrorKind::Unsupported, message));
         }
         let model = load_model(dir, adapter)?;
         Ok(Handle {
