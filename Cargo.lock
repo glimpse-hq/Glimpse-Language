@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "glimpse-language"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ash",
  "dispatch2",
