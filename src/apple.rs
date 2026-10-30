@@ -56,6 +56,20 @@ pub fn apple_availability() -> AppleAvailability {
     }
 }
 
+/// Base language codes ("en", "ja") the on-device model supports, whether or
+/// not it is available right now; empty before macOS 26 or on builds without
+/// it. Asks the framework each call, so cache the result.
+pub fn apple_supported_languages() -> Vec<String> {
+    #[cfg(apple_model)]
+    {
+        shim::supported_languages()
+    }
+    #[cfg(not(apple_model))]
+    {
+        Vec::new()
+    }
+}
+
 /// Load the model and prefill `instructions` so the next `apple_generate`
 /// with the same instructions starts faster. Returns immediately.
 #[allow(unused_variables)]
@@ -123,6 +137,7 @@ mod shim {
             max_tokens: i32,
             timeout_ms: i64,
         ) -> *mut c_char;
+        fn gl_apple_supported_languages() -> *mut c_char;
         fn gl_apple_string_free(ptr: *mut c_char);
     }
 
@@ -144,6 +159,15 @@ mod shim {
                 "on-device model unavailable",
             )),
         }
+    }
+
+    pub fn supported_languages() -> Vec<String> {
+        let ptr = unsafe { gl_apple_supported_languages() };
+        let raw = unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { gl_apple_string_free(ptr) };
+        serde_json::from_str(&raw).unwrap_or_default()
     }
 
     #[derive(Deserialize)]

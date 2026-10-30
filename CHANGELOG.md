@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `apple`: `apple_supported_languages()` lists the base language codes the on-device model supports.
+
 ## 0.1.0
 
 ### Added

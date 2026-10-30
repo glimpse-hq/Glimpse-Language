@@ -130,6 +130,14 @@ public func gl_apple_generate(
     return strdup(jsonString(box.value!))!
 }
 
+// JSON array of the base language codes the model supports, like ["en","ja"].
+@_cdecl("gl_apple_supported_languages")
+public func gl_apple_supported_languages() -> UnsafeMutablePointer<CChar> {
+    guard #available(macOS 26.0, *) else { return strdup("[]")! }
+    let codes = Set(model.supportedLanguages.compactMap { $0.languageCode?.identifier })
+    return strdup(jsonString(codes.sorted()))!
+}
+
 @_cdecl("gl_apple_string_free")
 public func gl_apple_string_free(_ pointer: UnsafeMutablePointer<CChar>?) {
     free(pointer)
