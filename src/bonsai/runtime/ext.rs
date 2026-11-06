@@ -8,6 +8,7 @@ use super::{Model, Prefix, QWEN35, Spec, Stats, Template};
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 thread_local! {
@@ -44,7 +45,7 @@ pub(crate) fn user_turn(t: &Template, user: &str) -> String {
     format!("{}{}{}{}", t.user.0, user.trim(), t.user.1, t.assistant)
 }
 
-/// What stays when idle: device and pipelines, mapped weights, tokenizer, cached prefix states.
+/// What stays when idle: device and pipelines, mapped weights, tokenizer and its draft keys, cached prefix states.
 pub(crate) struct Idle {
     gpu: Gpu,
     w: Weights,
@@ -56,6 +57,7 @@ pub(crate) struct Idle {
     prefixes: Vec<Prefix>,
     adapter: u64,
     prefix_dir: Option<PathBuf>,
+    keys: OnceLock<Arc<Vec<u64>>>,
 }
 
 pub(crate) enum RunError {
@@ -86,6 +88,7 @@ impl Model {
             prefixes,
             adapter,
             prefix_dir,
+            keys,
             ..
         } = self;
         Idle {
@@ -99,6 +102,7 @@ impl Model {
             prefixes,
             adapter,
             prefix_dir,
+            keys,
         }
     }
 
@@ -189,7 +193,7 @@ impl Idle {
             spec: self.spec,
             ignore_eos: false,
             pending: None,
-            keys: Default::default(),
+            keys: self.keys,
         }
     }
 }
