@@ -75,6 +75,9 @@ if availability() == Availability::Available {
 - `Bonsai::load(dir, adapter)`: loads the model and an optional LoRA adapter.
 - `prewarm(system_prompt)`: caches the system prompt so `generate` prefills only the user turn. The last three prompts are cached and saved to `prefix-cache/` for the next launch.
 - `generate(...)`: greedy decoding until end of turn or `max_tokens`. `cancel` stops decoding within one step.
+- `generate_streaming(..., on_text)`: `generate`, with `on_text` seeing the output as it is decoded. Returning `ControlFlow::Break` stops the run with `StopReason::Stopped`.
+- `count_tokens(text)`: the number of tokens `text` encodes to.
+- `device()`: the GPU and driver version Bonsai runs on, for redoing checks after a driver update.
 - `release_idle()`: frees the GPU buffers and keeps the weights and cached prompts. Drop the `Bonsai` to free everything.
 
 Speculation drafts tokens from the user's own text and verifies them in one pass. On Metal the output is identical to plain greedy decoding.

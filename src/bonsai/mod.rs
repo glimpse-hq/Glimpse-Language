@@ -5,6 +5,7 @@
 //! Runs through our own runtime in `runtime/`: Metal kernels on Apple Silicon (macOS 14+), Vulkan kernels on
 //! Windows. Everywhere else `availability` reports `Unsupported` and `Bonsai::load` fails.
 
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -118,6 +119,8 @@ pub enum StopReason {
     MaxTokens,
     /// Stopped below `max_tokens` because the context was full.
     ContextFull,
+    /// `generate_streaming`'s `on_text` asked to stop.
+    Stopped,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -152,6 +155,19 @@ pub fn availability() -> Availability {
     #[cfg(not(bonsai_backend))]
     {
         Availability::Unsupported
+    }
+}
+
+/// The GPU Bonsai runs on here and its driver version (the macOS version on Metal), for telling when either
+/// changes. `None` when unsupported. Cheap after the first call on Windows.
+pub fn device() -> Option<String> {
+    #[cfg(bonsai_backend)]
+    {
+        handle::device()
+    }
+    #[cfg(not(bonsai_backend))]
+    {
+        None
     }
 }
 
@@ -267,14 +283,43 @@ impl Bonsai {
         options: &GenerateOptions,
         cancel: Option<&AtomicBool>,
     ) -> Result<Generation, BonsaiError> {
+        self.generate_streaming(system_prompt, user_text, options, cancel, |_| {
+            ControlFlow::Continue(())
+        })
+    }
+
+    /// `generate`, with `on_text` called for each piece of output as it is decoded. Returning `Break`
+    /// stops decoding within one step; the result then has the text so far and `StopReason::Stopped`.
+    /// Watching does not change the output.
+    pub fn generate_streaming(
+        &self,
+        system_prompt: &str,
+        user_text: &str,
+        options: &GenerateOptions,
+        cancel: Option<&AtomicBool>,
+        mut on_text: impl FnMut(&str) -> ControlFlow<()>,
+    ) -> Result<Generation, BonsaiError> {
         #[cfg(bonsai_backend)]
         {
             self.inner
-                .generate(system_prompt, user_text, options, cancel)
+                .generate(system_prompt, user_text, options, cancel, &mut on_text)
         }
         #[cfg(not(bonsai_backend))]
         {
-            let _ = (system_prompt, user_text, options, cancel);
+            let _ = (system_prompt, user_text, options, cancel, &mut on_text);
+            match self.inner {}
+        }
+    }
+
+    /// Tokens `text` encodes to with this model's tokenizer, as in a prompt. Blocking.
+    pub fn count_tokens(&self, text: &str) -> Result<usize, BonsaiError> {
+        #[cfg(bonsai_backend)]
+        {
+            self.inner.count_tokens(text)
+        }
+        #[cfg(not(bonsai_backend))]
+        {
+            let _ = text;
             match self.inner {}
         }
     }

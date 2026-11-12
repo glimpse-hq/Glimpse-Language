@@ -1,15 +1,16 @@
 #version 460
 #include "common.glsl"
 // Gated delta rule, sequential over T. State [NV, 128 (v), 128 (k)] fp32; v head h reads q/k head h / (NV / NK).
-// Grid (NV, 32), workgroup (32 lanes over k, 4 dv rows); each thread holds 4 k entries of one dv row. In place safe.
-layout(local_size_x = 32, local_size_y = 4) in;
+// Grid (NV, 32), workgroup of 4 subgroups, one dv row each (32 lanes over k); each thread holds 4 k entries of its
+// row. In place safe. 1D, since a 2D workgroup's lanes need not map to subgroups by row (Intel's do not).
+layout(local_size_x = 128) in;
 layout(push_constant) uniform P { PTR qkvc; PTR ab; PTR A_log; PTR dt_bias; PTR sin_; PTR sout; PTR y; uint T; uint NK; uint NV; } pc;
 void main() {
-    uint hd = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x;
+    uint hd = gl_WorkGroupID.x, lane = LANE;
     uint NK = pc.NK, NV = pc.NV;
     uint hk = hd / (NV / NK);
     uint C = (2u * NK + NV) * 128u;
-    uint dv = gl_WorkGroupID.y * 4u + gl_LocalInvocationID.y;
+    uint dv = gl_WorkGroupID.y * 4u + SID;
     uint base = (hd * 128u + dv) * 128u + lane * 4u;
     vec4 st = f4(pc.sin_, base);
     float ea = exp(Fp(pc.A_log).v[hd]);
