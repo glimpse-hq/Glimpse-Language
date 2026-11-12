@@ -1,6 +1,7 @@
 //! The public API over the runtime (Metal or Vulkan): one model behind a mutex, idle release, panics turned
 //! into errors.
 
+use std::ops::ControlFlow;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -46,8 +47,28 @@ pub fn availability() -> Availability {
     })
 }
 
+#[cfg(bonsai_vulkan)]
+pub fn device() -> Option<String> {
+    super::runtime::gpu::available().ok()
+}
+
+#[cfg(bonsai_metal)]
+pub fn device() -> Option<String> {
+    let name = MTLCreateSystemDefaultDevice()?.name().to_string();
+    Some(format!("{name} (macOS {})", macos_version()))
+}
+
 #[cfg(bonsai_metal)]
 fn macos_major() -> u32 {
+    macos_version()
+        .split('.')
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+#[cfg(bonsai_metal)]
+fn macos_version() -> String {
     let mut buf = [0u8; 32];
     let mut len = buf.len();
     let ok = unsafe {
@@ -60,12 +81,9 @@ fn macos_major() -> u32 {
         )
     } == 0;
     if !ok {
-        return 0;
+        return String::new();
     }
-    std::str::from_utf8(&buf[..len.saturating_sub(1)])
-        .ok()
-        .and_then(|v| v.split('.').next()?.parse().ok())
-        .unwrap_or(0)
+    String::from_utf8_lossy(&buf[..len.saturating_sub(1)]).into_owned()
 }
 
 enum State {
@@ -108,12 +126,22 @@ impl Handle {
         self.with_model(|model| model.prewarm_system(system))
     }
 
+    pub fn count_tokens(&self, text: &str) -> Result<usize, BonsaiError> {
+        match &*self.lock() {
+            State::Loaded(model) => return Ok(model.count_tokens(text)),
+            State::Idle(idle) => return Ok(idle.count_tokens(text)),
+            State::Unloaded => {}
+        }
+        self.with_model(|model| Ok(model.count_tokens(text)))
+    }
+
     pub fn generate(
         &self,
         system: &str,
         user: &str,
         options: &GenerateOptions,
         cancel: Option<&AtomicBool>,
+        on_text: &mut dyn FnMut(&str) -> ControlFlow<()>,
     ) -> Result<Generation, BonsaiError> {
         let run = self.with_model(|model| {
             model.run(
@@ -123,10 +151,13 @@ impl Handle {
                 options.stop_at_eos,
                 options.speculate,
                 cancel,
+                on_text,
             )
         })?;
         let st = run.stats;
-        let stop = if st.gen_tokens < run.max_tokens {
+        let stop = if run.stopped {
+            StopReason::Stopped
+        } else if st.gen_tokens < run.max_tokens {
             StopReason::Eos
         } else if run.max_tokens < options.max_tokens {
             StopReason::ContextFull

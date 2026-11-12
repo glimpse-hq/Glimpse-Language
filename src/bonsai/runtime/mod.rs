@@ -344,7 +344,9 @@ impl Model {
         let mut i = 0;
         let d = self.text.cfg.hidden;
         while i < ids.len() {
-            let t = (ids.len() - i).min(TMAX);
+            // a remainder of up to 16 rows joins the chunk before it, keeping the matmuls on their T > 16 kernel
+            let left = ids.len() - i;
+            let t = if left <= gpu::PREFILL_ROWS + 16 { left } else { gpu::PREFILL_ROWS }.min(TMAX);
             self.text.write_ids(&ids[i..i + t]);
             self.text.write_pos(&pos[i..i + t]);
             let wb = &self.w.buf;
@@ -779,7 +781,7 @@ impl Model {
         stream: &mut Utf8Stream,
         emit: &mut impl FnMut(&str),
     ) {
-        let cost = if self.text.cfg.hidden <= 2048 { &gpu::VERIFY_COST_2B } else { &gpu::VERIFY_COST_4B };
+        let cost = self.gpu.verify_cost(self.text.cfg.hidden);
         let mut pol = Policy::new(cost, sp.draft_max);
         let keys = self.keys.get_or_init(|| {
             std::sync::Arc::new((0..self.tok.vocab_len() as u32).map(|id| token_key(self.tok.token_bytes(id))).collect())
