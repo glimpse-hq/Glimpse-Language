@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0
+
+### Changed
+
+- `apple`: `apple_supports_language()` asks the on-device model whether it supports a language, replacing `apple_supported_languages()`. Codes the model lists under another name now match, like Whisper's "no" for Norwegian, which it lists as "nb".
+
 ## 0.2.0
 
 ### Added
