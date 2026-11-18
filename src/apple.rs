@@ -56,17 +56,18 @@ pub fn apple_availability() -> AppleAvailability {
     }
 }
 
-/// Base language codes ("en", "ja") the on-device model supports, whether or
-/// not it is available right now; empty before macOS 26 or on builds without
-/// it. Asks the framework each call, so cache the result.
-pub fn apple_supported_languages() -> Vec<String> {
+/// Whether the on-device model supports `language`, a code like "en", "no" or
+/// "pt-BR", whether or not it is available right now. False before macOS 26
+/// or on builds without it.
+#[allow(unused_variables)]
+pub fn apple_supports_language(language: &str) -> bool {
     #[cfg(apple_model)]
     {
-        shim::supported_languages()
+        shim::supports_language(language)
     }
     #[cfg(not(apple_model))]
     {
-        Vec::new()
+        false
     }
 }
 
@@ -137,7 +138,7 @@ mod shim {
             max_tokens: i32,
             timeout_ms: i64,
         ) -> *mut c_char;
-        fn gl_apple_supported_languages() -> *mut c_char;
+        fn gl_apple_supports_language(code: *const c_char) -> bool;
         fn gl_apple_string_free(ptr: *mut c_char);
     }
 
@@ -161,13 +162,8 @@ mod shim {
         }
     }
 
-    pub fn supported_languages() -> Vec<String> {
-        let ptr = unsafe { gl_apple_supported_languages() };
-        let raw = unsafe { CStr::from_ptr(ptr) }
-            .to_string_lossy()
-            .into_owned();
-        unsafe { gl_apple_string_free(ptr) };
-        serde_json::from_str(&raw).unwrap_or_default()
+    pub fn supports_language(language: &str) -> bool {
+        cstring(language).is_ok_and(|code| unsafe { gl_apple_supports_language(code.as_ptr()) })
     }
 
     #[derive(Deserialize)]
