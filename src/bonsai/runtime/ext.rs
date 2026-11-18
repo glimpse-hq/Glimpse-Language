@@ -6,6 +6,7 @@ use super::tokenizer::Tokenizer;
 use super::weights::Weights;
 use super::{Model, Prefix, QWEN35, Spec, Stats, Template};
 use std::cell::Cell;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -13,10 +14,14 @@ use std::time::Instant;
 
 thread_local! {
     static CANCEL: Cell<*const AtomicBool> = const { Cell::new(std::ptr::null()) };
+    static STOPPED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Checked by the decode loops between steps.
 pub(crate) fn cancelled() -> bool {
+    if STOPPED.with(Cell::get) {
+        return true;
+    }
     let flag = CANCEL.with(Cell::get);
     // Only set by `with_cancel`, which outlives every read.
     !flag.is_null() && unsafe { &*flag }.load(Ordering::Relaxed)
@@ -27,9 +32,11 @@ fn with_cancel<R>(flag: Option<&AtomicBool>, f: impl FnOnce() -> R) -> R {
     impl Drop for Reset {
         fn drop(&mut self) {
             CANCEL.with(|c| c.set(std::ptr::null()));
+            STOPPED.with(|c| c.set(false));
         }
     }
     CANCEL.with(|c| c.set(flag.map_or(std::ptr::null(), |f| f as *const AtomicBool)));
+    STOPPED.with(|c| c.set(false));
     let _reset = Reset;
     f()
 }
@@ -71,6 +78,8 @@ pub(crate) struct Run {
     pub stats: Stats,
     /// Output cap after fitting it into the context.
     pub max_tokens: usize,
+    /// `on_text` asked to stop.
+    pub stopped: bool,
 }
 
 impl Model {
@@ -128,7 +137,12 @@ impl Model {
         self.start_system(system).map(|_| ())
     }
 
-    /// One greedy request. The output cap shrinks to what the context has room for.
+    pub(crate) fn count_tokens(&self, text: &str) -> usize {
+        self.tok.encode(text).len()
+    }
+
+    /// One greedy request. The output cap shrinks to what the context has room for. `on_text` sees the
+    /// output as it is decoded; `Break` stops decoding within one step.
     pub(crate) fn run(
         &mut self,
         system: &str,
@@ -137,6 +151,7 @@ impl Model {
         stop_at_eos: bool,
         speculate: bool,
         cancel: Option<&AtomicBool>,
+        on_text: &mut dyn FnMut(&str) -> ControlFlow<()>,
     ) -> Result<Run, RunError> {
         let t0 = Instant::now();
         let prefix = self.start_system(system)?;
@@ -159,8 +174,13 @@ impl Model {
             self.spec = None;
         }
         self.ignore_eos = !stop_at_eos;
-        let result = with_cancel(cancel, || {
-            self.generate_after_prefix(raw, None, max_tokens, t0, st, |_| {})
+        let (result, stopped) = with_cancel(cancel, || {
+            let result = self.generate_after_prefix(raw, None, max_tokens, t0, st, |text| {
+                if !STOPPED.with(Cell::get) && on_text(text).is_break() {
+                    STOPPED.with(|c| c.set(true));
+                }
+            });
+            (result, STOPPED.with(Cell::get))
         });
         self.spec = spec;
         self.ignore_eos = false;
@@ -172,11 +192,16 @@ impl Model {
             text: self.tok.decode(&ids),
             stats,
             max_tokens,
+            stopped,
         })
     }
 }
 
 impl Idle {
+    pub(crate) fn count_tokens(&self, text: &str) -> usize {
+        self.tok.encode(text).len()
+    }
+
     pub(crate) fn wake(self) -> Model {
         let text = Text::new(&self.gpu, &self.w, &self.cfg, self.ctx);
         Model {

@@ -18,6 +18,9 @@ pub static METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.m
 pub const VERIFY_COST_2B: [f64; 8] = [1.0, 1.57, 2.1, 2.6, 2.6, 2.6, 2.65, 2.65];
 pub const VERIFY_COST_4B: [f64; 8] = [1.0, 1.6, 2.15, 2.8, 2.85, 2.9, 2.95, 3.0];
 
+/// Prompt tokens per prefill submission.
+pub const PREFILL_ROWS: usize = super::model::TMAX;
+
 /// All kernels as built, for identifying saved states made with other kernels.
 pub static KERNEL_BLOB: &[u8] = METALLIB;
 
@@ -79,6 +82,10 @@ impl Gpu {
     /// Same as `buffer` on Metal (all memory is shared); host-visible memory on Vulkan.
     pub fn io_buffer(&self, bytes: usize) -> Buffer {
         self.buffer(bytes)
+    }
+
+    pub fn verify_cost(&self, hidden: usize) -> &'static [f64; 8] {
+        if hidden <= 2048 { &VERIFY_COST_2B } else { &VERIFY_COST_4B }
     }
 
     pub fn device_name(&self) -> String {

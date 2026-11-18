@@ -1,7 +1,7 @@
 //! Thin Vulkan layer with the surface of gpu.rs (Metal): device, queue, kernels precompiled to SPIR-V, buffers
 //! passed to kernels by device address in push constants. A Cmd collects dispatches and copies, each followed
 //! by a barrier (Metal's serial compute encoder), and at commit replays a cached command buffer when the same
-//! stream ran before. Subgroups are fixed at 32 lanes, the width the kernels assume.
+//! stream ran before. Kernels with subgroup operations get 32 lanes, the width they assume.
 
 use ash::vk;
 use std::collections::HashMap;
@@ -18,6 +18,13 @@ mod spv {
 /// on cooperative matrices, so rows past the first cost little and the curve is flat.
 pub const VERIFY_COST_2B: [f64; 8] = [1.0, 2.2, 2.2, 2.2, 2.25, 2.25, 2.3, 2.35];
 pub const VERIFY_COST_4B: [f64; 8] = [1.0, 2.15, 2.15, 2.15, 2.2, 2.2, 2.25, 2.3];
+/// Without cooperative matrices (2B on an Iris Xe, from per-kernel GPU times): T = 2, 3 run on qmvr, T >= 4 on qmvx,
+/// which spills registers at 32 lanes on Intel.
+pub const VERIFY_COST_PLAIN: [f64; 8] = [1.0, 1.2, 1.6, 16.0, 16.0, 16.0, 16.0, 16.0];
+
+/// Prompt tokens per prefill submission (up to 16 more for the last). Windows resets the GPU when a submission runs
+/// past 2 s; an Iris Xe takes about 0.6 s per 32 rows, and qmm3 tiles 32 rows, so smaller submissions cost little.
+pub const PREFILL_ROWS: usize = 32;
 
 /// All kernels as built, for identifying saved states made with other kernels.
 pub static KERNEL_BLOB: &[u8] = spv::ALL;
@@ -320,13 +327,22 @@ fn instance() -> Result<(ash::Entry, ash::Instance), String> {
     Ok((entry, instance))
 }
 
-/// Whether a suitable Vulkan GPU exists (cached; creates and drops an instance on the first call).
+/// The Vulkan GPU the runtime would use and its driver version, or why there is none (cached; creates and drops an
+/// instance on the first call).
 pub fn available() -> Result<String, String> {
     static PROBE: OnceLock<Result<String, String>> = OnceLock::new();
     PROBE
         .get_or_init(|| {
             let (_entry, inst) = instance()?;
-            let r = pick_device(&inst).map(|(_, _, n, _)| n);
+            let r = pick_device(&inst).map(|(pd, _, name, _)| {
+                let mut driver = vk::PhysicalDeviceDriverProperties::default();
+                let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut driver);
+                unsafe { inst.get_physical_device_properties2(pd, &mut p2) };
+                let info = unsafe { CStr::from_ptr(driver.driver_info.as_ptr()) }.to_string_lossy();
+                // some drivers leave the info string empty; the packed version always changes with the driver
+                let version = unsafe { inst.get_physical_device_properties(pd) }.driver_version;
+                format!("{name} (driver {info} {version:#x})")
+            });
             unsafe { inst.destroy_instance(None) };
             r
         })
@@ -449,6 +465,14 @@ impl Gpu {
         Ok(Gpu { sh, pipes, name, coopmat, part })
     }
 
+    pub fn verify_cost(&self, hidden: usize) -> &'static [f64; 8] {
+        match (self.coopmat, hidden <= 2048) {
+            (false, _) => &VERIFY_COST_PLAIN,
+            (true, true) => &VERIFY_COST_2B,
+            (true, false) => &VERIFY_COST_4B,
+        }
+    }
+
     pub fn device_name(&self) -> String {
         self.name.clone()
     }
@@ -521,7 +545,10 @@ fn make_pipes(device: &ash::Device, control: bool, coopmat: bool) -> Result<Hash
     let range = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(PUSH_BYTES)];
     let mut modules = Vec::new();
     let mut layouts = Vec::new();
-    let kernels: Vec<&(&str, &[u8])> = spv::SPV.iter().filter(|(n, _)| coopmat || !n.starts_with("qmm_")).collect();
+    let mut subgroups = Vec::new();
+    // Intel's compiler crashes the process on a cooperative-matrix kernel when the device has none
+    let kernels: Vec<&(&str, &[u8])> =
+        spv::SPV.iter().filter(|(n, _)| coopmat || !(n.starts_with("qmm_") || n.ends_with("_cm"))).collect();
     for (name, bytes) in kernels.iter().copied() {
         let words = ash::util::read_spv(&mut std::io::Cursor::new(bytes)).map_err(|e| format!("{name}: {e}"))?;
         let m = unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None) }
@@ -530,6 +557,7 @@ fn make_pipes(device: &ash::Device, control: bool, coopmat: bool) -> Result<Hash
             .map_err(|e| format!("{name}: {e}"))?;
         modules.push(m);
         layouts.push(l);
+        subgroups.push(uses_subgroups(&words));
     }
     let mut req: Vec<vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo> =
         kernels.iter().map(|_| vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(SUBGROUP)).collect();
@@ -541,7 +569,8 @@ fn make_pipes(device: &ash::Device, control: bool, coopmat: bool) -> Result<Hash
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(modules[i])
                 .name(c"main");
-            if control {
+            // a size the driver picks itself can be much faster: Intel runs qmm3 4 to 5 times faster than at 32
+            if control && subgroups[i] {
                 stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS).push_next(r);
             }
             vk::ComputePipelineCreateInfo::default().stage(stage).layout(layouts[i])
@@ -557,6 +586,18 @@ fn make_pipes(device: &ash::Device, control: bool, coopmat: bool) -> Result<Hash
         .zip(pipelines.into_iter().zip(layouts))
         .map(|((name, _), (pipeline, layout))| (*name, Pipe { pipeline, layout }))
         .collect())
+}
+
+/// Whether a SPIR-V module declares OpCapability GroupNonUniform.
+fn uses_subgroups(words: &[u32]) -> bool {
+    let mut i = 5;
+    while let Some(&w) = words.get(i) {
+        if w & 0xffff == 17 && words.get(i + 1) == Some(&61) {
+            return true;
+        }
+        i += (w >> 16).max(1) as usize;
+    }
+    false
 }
 
 /// A buffer binding: buffer plus byte offset.
