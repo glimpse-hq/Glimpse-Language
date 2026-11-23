@@ -4,6 +4,7 @@
 
 ### Changed
 
+- The minimum supported Rust version is 1.100.
 - `bonsai`: `Bonsai::prewarm` takes `save_prompt`, and `GenerateOptions` has `save_prompt` (on by default). Off keeps the prompt's state in memory only, for prompts that hold per-request text such as a window title or URL.
 
 ### Fixed
