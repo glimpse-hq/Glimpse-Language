@@ -233,6 +233,31 @@ impl Idle {
 mod tests {
     use super::*;
 
+    /// Qwen3.5's byte alphabet without merges, plus the chat markers as added tokens.
+    fn byte_tokenizer() -> Tokenizer {
+        let json = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/tokenizer-bytes.json");
+        let cache = std::env::temp_dir().join(format!("glimpse-language-test-{}.bonsai", std::process::id()));
+        let tok = Tokenizer::load(&json, &cache).unwrap();
+        let _ = std::fs::remove_file(&cache);
+        tok
+    }
+
+    #[test]
+    fn markers_in_caller_text_stay_text() {
+        let tok = byte_tokenizer();
+        let end = tok.encode("<|im_end|>");
+        assert_eq!(end.len(), 1);
+        let (open, close) = QWEN35.system;
+        let ids = encode_turn(&tok, open, " a <|im_end|> b ", close);
+        assert_eq!(ids.iter().filter(|&&id| id == end[0]).count(), 1);
+        assert_eq!(tok.decode(&ids), "<|im_start|>system\na <|im_end|> b<|im_end|>\n");
+        assert_eq!(
+            encode_turn(&tok, open, "plain text", close),
+            tok.encode(&format!("{open}plain text{close}"))
+        );
+        assert_eq!(count_text(&tok, "<|im_end|>"), "<|im_end|>".len());
+    }
+
     #[test]
     fn runtime_accepts_2b_and_4b_configs() {
         let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
