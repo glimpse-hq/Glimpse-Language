@@ -42,7 +42,49 @@
  };
  
  /// Prompt-lookup speculation: draft the source tokens that followed an occurrence of the output's last n words
-@@ -247,7 +244,6 @@
+@@ -82,6 +79,7 @@
+ /// Drafts for the output so far (`seq`, which ends with the output): the source tokens that followed an
+ /// occurrence of the last n word keys of `seq` (n = ngram_max down to ngram_min). Takes the first occurrence
+ /// that ends at or after `cursor` (where the previous draft's accepted part ended), else the first one.
++/// With no such match for any n, the nearest one further behind (a cursor that ran ahead in repeated text).
+ /// Returns the draft and the source position it starts at.
+ fn lookup(src: &Source, seq: &[u32], keys: &[u64], sp: &Spec, limit: usize, cursor: usize) -> (Vec<u32>, usize) {
+     let k = sp.draft_max.min(limit).min(model::VMAX - 1);
+@@ -100,15 +98,18 @@
+     }
+     pat.reverse();
+     let w = &src.words;
++    let mut far = None;
+     for n in (sp.ngram_min..=sp.ngram_max.min(pat.len())).rev() {
+         let p = &pat[pat.len() - n..];
+-        let mut hit = None;
++        let (mut hit, mut behind) = (None, None);
+         for i in 0..w.len().saturating_sub(n - 1) {
+             if w[i..i + n].iter().zip(p).all(|(a, b)| a.0 == *b) {
+                 let j = w[i + n - 1].1 + 1;
+                 // the output moves forward through the source: a match far behind it is a different spot
+                 if j < src.ids.len() && j + BACK >= cursor && (hit.is_none() || j >= cursor) {
+                     hit = Some(j);
++                } else if j + BACK < cursor {
++                    behind = Some(j);
+                 }
+                 if j >= cursor {
+                     break;
+@@ -118,8 +119,12 @@
+         if let Some(j) = hit {
+             return (src.ids[j..(j + k).min(src.ids.len())].to_vec(), j);
+         }
++        far = far.or(behind);
+     }
+-    (Vec::new(), cursor)
++    match far {
++        Some(j) => (src.ids[j..(j + k).min(src.ids.len())].to_vec(), j),
++        None => (Vec::new(), cursor),
++    }
+ }
+ 
+ /// How far behind the cursor a lookup match may start (self-corrections repeat a few words).
+@@ -247,7 +252,6 @@
      pub prompt_tokens: usize,
      pub cached_tokens: usize,
      pub gen_tokens: usize,
@@ -50,7 +92,7 @@
      pub prefill_s: f64,
      pub ttft_s: f64,
      pub decode_s: f64,
-@@ -264,7 +260,6 @@
+@@ -264,7 +268,6 @@
      pub text: Text,
      pub tok: Tokenizer,
      pub template: Template,
@@ -58,7 +100,7 @@
      /// Cached prefix states, most recently used first.
      prefixes: Vec<Prefix>,
      /// Identity of the installed adapter (`adapter_id`), 0 without one.
-@@ -310,7 +305,6 @@
+@@ -310,7 +313,6 @@
              text,
              tok,
              template: QWEN35,
@@ -66,7 +108,7 @@
              prefixes: Vec::new(),
              adapter: 0,
              prefix_dir: None,
-@@ -335,13 +329,11 @@
+@@ -335,14 +337,15 @@
          Ok(())
      }
  
@@ -79,10 +121,15 @@
          let mut next = 0;
          let mut i = 0;
 -        let d = self.text.cfg.hidden;
-         while i < ids.len() {
+-        while i < ids.len() {
++        while i < ids.len() {
++            if ext::cancelled() {
++                return EOS[0];
++            }
              // a remainder of up to 16 rows joins the chunk before it, keeping the matmuls on their T > 16 kernel
              let left = ids.len() - i;
-@@ -351,21 +343,6 @@
+             let t = if left <= gpu::PREFILL_ROWS + 16 { left } else { gpu::PREFILL_ROWS }.min(TMAX);
+@@ -351,21 +354,6 @@
              let wb = &self.w.buf;
              let mut cmd = self.gpu.begin();
              self.text.encode_embed(&mut cmd, wb, t);
@@ -104,7 +151,7 @@
              self.text.encode_layers(&mut cmd, wb, t, false);
              let last = i + t == ids.len();
              if last {
-@@ -469,7 +446,7 @@
+@@ -469,7 +457,7 @@
              return prefix.len();
          }
          self.reset();
@@ -113,7 +160,7 @@
          let mut snap = self.new_snapshot(self.text.state.len);
          snap.len = self.text.state.len;
          snap.pos = self.text.state.pos;
-@@ -593,85 +570,39 @@
+@@ -593,85 +581,39 @@
          self.prefixes.clear();
      }
  
@@ -205,7 +252,7 @@
          st.prefill_s = tp.elapsed().as_secs_f64();
          st.ttft_s = t0.elapsed().as_secs_f64();
          let td = Instant::now();
-@@ -801,6 +732,9 @@
+@@ -801,6 +743,9 @@
          // realized tokens and table cost of recent verify rounds (decayed like the policy's counts)
          let (mut got, mut spent, mut rounds) = (0.0, 0.0, 0);
          while out.len() < max_tokens {
@@ -215,7 +262,7 @@
              let last = *seq.last().unwrap();
              let left = max_tokens - out.len();
              if rounds >= GIVE_UP_ROUNDS && got < KEEP_GAIN * spent {
-@@ -913,6 +847,10 @@
+@@ -913,6 +858,10 @@
          self.text.encode_step(&mut cmd, &self.w.buf, k);
          let mut prev = cmd.commit();
          while out.len() < max_tokens {
@@ -283,6 +330,56 @@
      pub fn hidden(&self) -> &Buffer {
          &self.s.h
      }
+--- a/src/bonsai/runtime/tokenizer.rs
++++ b/src/bonsai/runtime/tokenizer.rs
+@@ -38,8 +38,8 @@
+ }
+ 
+ impl Tokenizer {
+-    /// Loads `cache` if it was built from this tokenizer.json (size and mtime match), otherwise parses
+-    /// the JSON and writes the cache (best effort).
++    /// Loads `cache` if it was built from this tokenizer.json (size and mtime match) and its checksum holds,
++    /// otherwise parses the JSON and writes the cache (best effort).
+     pub fn load(json: &Path, cache: &Path) -> Result<Tokenizer, String> {
+         let meta = std::fs::metadata(json).map_err(|e| format!("{}: {e}", json.display()))?;
+         let stamp = meta.len()
+@@ -137,7 +137,7 @@
+     fn to_cache(&self, stamp: u64) -> Vec<u8> {
+         let mut o = Vec::new();
+         let u = |o: &mut Vec<u8>, v: u32| o.extend_from_slice(&v.to_le_bytes());
+-        o.extend_from_slice(b"BTK1");
++        o.extend_from_slice(b"BTK2");
+         o.extend_from_slice(&stamp.to_le_bytes());
+         u(&mut o, self.offs.len() as u32);
+         u(&mut o, self.blob.len() as u32);
+@@ -160,12 +160,16 @@
+             u(&mut o, s.len() as u32);
+             o.extend_from_slice(s.as_bytes());
+         }
++        let sum = super::hash_bytes(super::FNV, &o);
++        o.extend_from_slice(&sum.to_le_bytes());
+         o
+     }
+ 
+     fn from_cache(b: &[u8], stamp: u64) -> Option<Tokenizer> {
++        let (b, sum) = b.split_at_checked(b.len().checked_sub(8)?)?;
+         if b.len() < 28
+-            || &b[..4] != b"BTK1"
++            || u64::from_le_bytes(sum.try_into().ok()?) != super::hash_bytes(super::FNV, b)
++            || &b[..4] != b"BTK2"
+             || u64::from_le_bytes(b[4..12].try_into().ok()?) != stamp
+         {
+             return None;
+@@ -256,7 +260,8 @@
+         out
+     }
+ 
+-    fn encode_plain(&self, text: &str, out: &mut Vec<u32>) {
++    /// `encode` without added tokens: every character is text.
++    pub fn encode_plain(&self, text: &str, out: &mut Vec<u32>) {
+         let mut i = 0;
+         while i < text.len() {
+             let m = self.split.find_at(text, i).unwrap();
 --- a/src/bonsai/runtime/kernels.metal
 +++ b/src/bonsai/runtime/kernels.metal
 @@ -839,164 +839,4 @@

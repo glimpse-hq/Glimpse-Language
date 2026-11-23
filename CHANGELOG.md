@@ -2,9 +2,22 @@
 
 ## Unreleased
 
+### Changed
+
+- The minimum supported Rust version is 1.100.
+- `bonsai`: `Bonsai::prewarm` takes `save_prompt`, and `GenerateOptions` has `save_prompt` (on by default). Off keeps the prompt's state in memory only, for prompts that hold per-request text such as a window title or URL.
+
 ### Removed
 
 - `bonsai`: the unused image input code and its `image` dependency (18 fewer crates).
+
+### Fixed
+
+- `bonsai`: loading deletes saved prompt states it can no longer use (from another build, model or adapter) instead of leaving them on disk.
+- `bonsai`: chat markers such as `<|im_end|>` inside the system prompt or user text are read as plain text, so the output no longer stops early or drops them. `count_tokens` counts them the same way.
+- `bonsai`: setting `cancel` also stops the user text's prefill at its next batch (512 tokens on Metal, 32 on Vulkan), so a request cancelled before it starts returns within a few milliseconds instead of after prefilling its text.
+- `bonsai`: a damaged `tokenizer.bonsai` is rebuilt instead of hanging the first request forever.
+- `bonsai`: speculation keeps working through long, repetitive dictations instead of giving up partway, with the same output.
 
 ## 0.3.0
 
