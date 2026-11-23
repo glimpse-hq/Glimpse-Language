@@ -6,11 +6,12 @@ use super::tokenizer::Tokenizer;
 use super::weights::Weights;
 use super::{Model, Prefix, QWEN35, Spec, Stats, Template};
 use std::cell::Cell;
+use std::io::Read;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 thread_local! {
     static CANCEL: Cell<*const AtomicBool> = const { Cell::new(std::ptr::null()) };
@@ -115,8 +116,9 @@ impl Model {
         }
     }
 
-    /// Restores or builds the cached state after the system turn. Returns the prefix length.
-    fn start_system(&mut self, system: &str) -> Result<usize, RunError> {
+    /// Restores or builds the cached state after the system turn. Returns the prefix length. Without `save`
+    /// the state stays in memory only.
+    fn start_system(&mut self, system: &str, save: bool) -> Result<usize, RunError> {
         let ids = if system.trim().is_empty() {
             Vec::new()
         } else {
@@ -129,12 +131,46 @@ impl Model {
                 context,
             });
         }
+        // Without a directory start_prefix neither loads nor saves the state.
+        let dir = if save { None } else { self.prefix_dir.take() };
         self.start_prefix(&ids);
+        if dir.is_some() {
+            self.prefix_dir = dir;
+        }
         Ok(ids.len())
     }
 
-    pub(crate) fn prewarm_system(&mut self, system: &str) -> Result<(), RunError> {
-        self.start_system(system).map(|_| ())
+    pub(crate) fn prewarm_system(&mut self, system: &str, save: bool) -> Result<(), RunError> {
+        self.start_system(system, save).map(|_| ())
+    }
+
+    /// Deletes saved prefix states this model cannot load (made by another executable, model, adapter or
+    /// format) and writes abandoned for a minute, so none outlive the build that wrote them.
+    pub(crate) fn remove_stale_prefixes(&self) {
+        let (Some(dir), Some(identity)) = (&self.prefix_dir, self.prefix_identity()) else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for path in entries.flatten().map(|e| e.path()) {
+            let stale = match path.extension().and_then(|x| x.to_str()) {
+                // a save in progress (another handle on this directory) writes for well under a second
+                Some("tmp") => std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > Duration::from_secs(60))),
+                Some("prefix") => {
+                    let mut head = vec![0; identity.len()];
+                    !std::fs::File::open(&path)
+                        .and_then(|mut f| f.read_exact(&mut head))
+                        .is_ok_and(|_| head == identity)
+                }
+                _ => false,
+            };
+            if stale {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
 
     pub(crate) fn count_tokens(&self, text: &str) -> usize {
@@ -150,11 +186,12 @@ impl Model {
         max_tokens: usize,
         stop_at_eos: bool,
         speculate: bool,
+        save_prompt: bool,
         cancel: Option<&AtomicBool>,
         on_text: &mut dyn FnMut(&str) -> ControlFlow<()>,
     ) -> Result<Run, RunError> {
         let t0 = Instant::now();
-        let prefix = self.start_system(system)?;
+        let prefix = self.start_system(system, save_prompt)?;
         let raw = self.tok.encode(&user_turn(&self.template, user));
         let context = self.text.ctx;
         let used = prefix + raw.len();
