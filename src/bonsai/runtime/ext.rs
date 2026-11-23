@@ -83,7 +83,7 @@ pub(crate) struct Run {
 }
 
 impl Model {
-    /// Drops the GPU buffers (scratch, KV cache, recurrent state, adapter, vision). Prefix states stay;
+    /// Drops the GPU buffers (scratch, KV cache, recurrent state, adapter). Prefix states stay;
     /// they are kept on wake when the same adapter is set again.
     pub(crate) fn into_idle(self) -> Idle {
         let cfg = self.text.cfg.clone();
@@ -175,7 +175,7 @@ impl Model {
         }
         self.ignore_eos = !stop_at_eos;
         let (result, stopped) = with_cancel(cancel, || {
-            let result = self.generate_after_prefix(raw, None, max_tokens, t0, st, |text| {
+            let result = self.generate_after_prefix(raw, max_tokens, t0, st, |text| {
                 if !STOPPED.with(Cell::get) && on_text(text).is_break() {
                     STOPPED.with(|c| c.set(true));
                 }
@@ -210,7 +210,6 @@ impl Idle {
             text,
             tok: self.tok,
             template: QWEN35,
-            vision: None,
             prefixes: self.prefixes,
             adapter: self.adapter,
             prefix_dir: self.prefix_dir,

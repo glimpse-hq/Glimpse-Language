@@ -8,7 +8,7 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 src=${1:-"$repo/../Glimpse-Lab/g1/rust"}
 dst="$repo/src/bonsai/runtime"
 
-for f in gpu gpu_vk lora model tokenizer vision weights; do
+for f in gpu gpu_vk lora model tokenizer weights; do
     sed 's/crate::/super::/g' "$src/src/$f.rs" > "$dst/$f.rs"
 done
 sed 's/crate::/super::/g' "$src/src/lib.rs" > "$dst/mod.rs"

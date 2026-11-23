@@ -1,6 +1,6 @@
 //! Minimal Metal runtime for PrismML Ternary Bonsai 2 (2B and 4B, sizes from config.json): one architecture,
-//! greedy decoding, text plus images, optional LoRA adapter.
-//! Single turn by design: optional system prompt (prefilled once and cached) plus user input, optional image.
+//! greedy decoding, text only, optional LoRA adapter.
+//! Single turn by design: optional system prompt (prefilled once and cached) plus user input.
 
 #[cfg(target_os = "macos")]
 pub mod gpu;
@@ -10,7 +10,6 @@ pub mod gpu;
 pub mod lora;
 pub mod model;
 pub mod tokenizer;
-pub mod vision;
 pub mod weights;
 pub(crate) mod ext;
 
@@ -22,7 +21,6 @@ use tokenizer::{Tokenizer, Utf8Stream};
 use weights::Weights;
 
 pub const EOS: [u32; 2] = [248046, 248044];
-pub const IMAGE_PAD: u32 = 248056;
 
 /// Qwen3.5 chat format pieces (from chat_template.jinja, thinking disabled). Kept as data so other turn
 /// shapes (tools) can be built without code changes.
@@ -30,14 +28,12 @@ pub struct Template {
     pub system: (&'static str, &'static str),
     pub user: (&'static str, &'static str),
     pub assistant: &'static str,
-    pub image: &'static str,
 }
 
 pub const QWEN35: Template = Template {
     system: ("<|im_start|>system\n", "<|im_end|>\n"),
     user: ("<|im_start|>user\n", "<|im_end|>\n"),
     assistant: "<|im_start|>assistant\n<think>\n\n</think>\n\n",
-    image: "<|vision_start|><|image_pad|><|vision_end|>",
 };
 
 /// Prompt-lookup speculation: draft the source tokens that followed an occurrence of the output's last n words
@@ -248,7 +244,6 @@ pub struct Stats {
     pub prompt_tokens: usize,
     pub cached_tokens: usize,
     pub gen_tokens: usize,
-    pub vision_s: f64,
     pub prefill_s: f64,
     pub ttft_s: f64,
     pub decode_s: f64,
@@ -265,7 +260,6 @@ pub struct Model {
     pub text: Text,
     pub tok: Tokenizer,
     pub template: Template,
-    vision: Option<vision::Vision>,
     /// Cached prefix states, most recently used first.
     prefixes: Vec<Prefix>,
     /// Identity of the installed adapter (`adapter_id`), 0 without one.
@@ -311,7 +305,6 @@ impl Model {
             text,
             tok,
             template: QWEN35,
-            vision: None,
             prefixes: Vec::new(),
             adapter: 0,
             prefix_dir: None,
@@ -336,13 +329,11 @@ impl Model {
         Ok(())
     }
 
-    /// Runs `ids` (with optional spliced embeddings) through the model; returns argmax after the last row.
-    /// `rows` are host embeddings for some rows: (row index, hidden-size floats).
-    pub fn prefill(&mut self, ids: &[u32], pos: &[[i32; 3]], rows: &[(usize, &[f32])]) -> u32 {
+    /// Runs `ids` through the model; returns argmax after the last row.
+    pub fn prefill(&mut self, ids: &[u32], pos: &[[i32; 3]]) -> u32 {
         self.flush_accept();
         let mut next = 0;
         let mut i = 0;
-        let d = self.text.cfg.hidden;
         while i < ids.len() {
             // a remainder of up to 16 rows joins the chunk before it, keeping the matmuls on their T > 16 kernel
             let left = ids.len() - i;
@@ -352,21 +343,6 @@ impl Model {
             let wb = &self.w.buf;
             let mut cmd = self.gpu.begin();
             self.text.encode_embed(&mut cmd, wb, t);
-            let spliced: Vec<_> = rows.iter().filter(|(r, _)| *r >= i && *r < i + t).collect();
-            if !spliced.is_empty() {
-                cmd.finish();
-                let h = self.text.hidden_ptr();
-                for (r, v) in spliced {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            v.as_ptr(),
-                            h.add((r - i) * d),
-                            d,
-                        )
-                    };
-                }
-                cmd = self.gpu.begin();
-            }
             self.text.encode_layers(&mut cmd, wb, t, false);
             let last = i + t == ids.len();
             if last {
@@ -470,7 +446,7 @@ impl Model {
             return prefix.len();
         }
         self.reset();
-        self.prefill(prefix, &Self::text_positions(0, prefix.len()), &[]);
+        self.prefill(prefix, &Self::text_positions(0, prefix.len()));
         let mut snap = self.new_snapshot(self.text.state.len);
         snap.len = self.text.state.len;
         snap.pos = self.text.state.pos;
@@ -594,85 +570,39 @@ impl Model {
         self.prefixes.clear();
     }
 
-    /// System prompt + user input (+ image) -> greedy output, streamed through `emit`.
+    /// System prompt + user input -> greedy output, streamed through `emit`.
     pub fn generate(
         &mut self,
         system: Option<&str>,
         user: &str,
-        image: Option<&Path>,
         max_tokens: usize,
         emit: impl FnMut(&str),
     ) -> Result<(Vec<u32>, Stats), String> {
         let t0 = Instant::now();
         let mut st = Stats::default();
-        // Vision first: it does not depend on the text state.
-        let img = match image {
-            Some(p) => {
-                if self.vision.is_none() {
-                    self.vision = Some(vision::Vision::new(&self.gpu, &self.w));
-                }
-                let v = self.vision.as_ref().unwrap();
-                let out = v.run(&self.gpu, &self.w.buf, p)?;
-                st.vision_s = t0.elapsed().as_secs_f64();
-                Some(out)
-            }
-            None => None,
-        };
         st.cached_tokens = self.start(system);
         let t = &self.template;
         let mut text = String::from(t.user.0);
-        if img.is_some() {
-            text.push_str(t.image);
-        }
         text.push_str(user.trim());
         text.push_str(t.user.1);
         text.push_str(t.assistant);
         let raw = self.tok.encode(&text);
-        self.generate_after_prefix(raw, img.as_ref(), max_tokens, t0, st, emit)
+        self.generate_after_prefix(raw, max_tokens, t0, st, emit)
     }
 
-    /// Prefills `raw` (user turn token ids, image pads expanded from `img`) on top of the current state
-    /// and decodes greedily.
+    /// Prefills `raw` (user turn token ids) on top of the current state and decodes greedily.
     pub fn generate_after_prefix(
         &mut self,
         raw: Vec<u32>,
-        img: Option<&vision::ImageOut>,
         max_tokens: usize,
         t0: Instant,
         mut st: Stats,
         mut emit: impl FnMut(&str),
     ) -> Result<(Vec<u32>, Stats), String> {
-        let p0 = self.text.state.pos;
-        let mut ids = Vec::with_capacity(raw.len());
-        let mut pos = Vec::with_capacity(raw.len());
-        let mut rows: Vec<(usize, &[f32])> = Vec::new();
-        let mut p = p0;
-        let d = self.text.cfg.hidden;
-        for &id in &raw {
-            if id == IMAGE_PAD {
-                if let Some(im) = img {
-                    let (gh, gw) = (im.grid.1 / 2, im.grid.2 / 2);
-                    for r in 0..gh {
-                        for c in 0..gw {
-                            rows.push((
-                                ids.len(),
-                                &im.embeds[(r * gw + c) * d..][..d],
-                            ));
-                            ids.push(IMAGE_PAD);
-                            pos.push([p, p + r as i32, p + c as i32]);
-                        }
-                    }
-                    p += gh.max(gw) as i32;
-                    continue;
-                }
-            }
-            ids.push(id);
-            pos.push([p; 3]);
-            p += 1;
-        }
-        st.prompt_tokens = ids.len();
+        let pos = Self::text_positions(self.text.state.pos, raw.len());
+        st.prompt_tokens = raw.len();
         let tp = Instant::now();
-        let next = self.prefill(&ids, &pos, &rows);
+        let next = self.prefill(&raw, &pos);
         st.prefill_s = tp.elapsed().as_secs_f64();
         st.ttft_s = t0.elapsed().as_secs_f64();
         let td = Instant::now();

@@ -13,14 +13,13 @@ homepage = "https://github.com/glimpse-hq/Glimpse-Language"
 [features]
 default = []
 apple = ["dep:serde", "dep:serde_json"]
-bonsai = ["dep:serde_json", "dep:objc2", "dep:objc2-foundation", "dep:objc2-metal", "dep:dispatch2", "dep:libc", "dep:half", "dep:regex", "dep:image", "dep:ash"]
+bonsai = ["dep:serde_json", "dep:objc2", "dep:objc2-foundation", "dep:objc2-metal", "dep:dispatch2", "dep:libc", "dep:half", "dep:regex", "dep:ash"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 half = { version = "2", default-features = false, optional = true }
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"], optional = true }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 
 # The Bonsai Metal runtime. Only built on Apple Silicon.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]

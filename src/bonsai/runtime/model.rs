@@ -34,7 +34,6 @@ pub struct Config {
     pub rotary_dims: usize,
     pub mrope: Vec<usize>,
     pub eps: f64,
-    pub vision_out: usize,
 }
 
 impl Config {
@@ -62,7 +61,6 @@ impl Config {
             rotary_dims: (head_dim as f64 * r["partial_rotary_factor"].as_f64().ok_or("config: partial_rotary_factor")?) as usize,
             mrope: r["mrope_section"].as_array().ok_or("config: mrope_section")?.iter().map(|v| v.as_u64().unwrap() as usize).collect(),
             eps: t["rms_norm_eps"].as_f64().ok_or("config: rms_norm_eps")?,
-            vision_out: u(&j["vision_config"], "out_hidden_size")?,
         })
     }
 
@@ -94,7 +92,6 @@ impl Config {
             ("linear_value_head_dim", self.lin_v_dim, 128),
             ("linear_conv_kernel_dim", self.conv_kernel, 4),
             ("q heads per kv head", self.heads / self.kv_heads.max(1), 4),
-            ("vision out_hidden_size", self.vision_out, self.hidden),
         ];
         for (k, got, w) in fixed {
             if got != w {
@@ -181,7 +178,7 @@ pub struct State {
     pub cap: usize,
     /// Tokens in the KV cache.
     pub len: usize,
-    /// Next mrope position (differs from len after an image).
+    /// Next mrope position.
     pub pos: i32,
 }
 
@@ -408,10 +405,6 @@ impl Text {
         gpu::zero(&self.state.conv, self.n_gdn * self.cfg.conv_state() * 4);
     }
 
-    /// Host access to the hidden input rows (for splicing image embeddings).
-    pub fn hidden_ptr(&self) -> *mut f32 {
-        contents::<f32>(&self.s.h)
-    }
     pub fn hidden(&self) -> &Buffer {
         &self.s.h
     }

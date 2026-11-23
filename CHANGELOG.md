@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Removed
+
+- `bonsai`: the unused image input code and its `image` dependency (18 fewer crates).
+
 ## 0.3.0
 
 ### Changed
