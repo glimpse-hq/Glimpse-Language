@@ -1,14 +1,48 @@
 --- a/src/bonsai/runtime/mod.rs
 +++ b/src/bonsai/runtime/mod.rs
-@@ -12,6 +12,7 @@
+@@ -1,6 +1,6 @@
+ //! Minimal Metal runtime for PrismML Ternary Bonsai 2 (2B and 4B, sizes from config.json): one architecture,
+-//! greedy decoding, text plus images, optional LoRA adapter.
+-//! Single turn by design: optional system prompt (prefilled once and cached) plus user input, optional image.
++//! greedy decoding, text only, optional LoRA adapter.
++//! Single turn by design: optional system prompt (prefilled once and cached) plus user input.
+ 
+ #[cfg(target_os = "macos")]
+ pub mod gpu;
+@@ -10,8 +10,8 @@
+ pub mod lora;
+ pub mod model;
  pub mod tokenizer;
- pub mod vision;
+-pub mod vision;
  pub mod weights;
 +pub(crate) mod ext;
  
  use gpu::Gpu;
  use model::{State, Text, TMAX};
-@@ -82,6 +83,7 @@
+@@ -21,7 +21,6 @@
+ use weights::Weights;
+ 
+ pub const EOS: [u32; 2] = [248046, 248044];
+-pub const IMAGE_PAD: u32 = 248056;
+ 
+ /// Qwen3.5 chat format pieces (from chat_template.jinja, thinking disabled). Kept as data so other turn
+ /// shapes (tools) can be built without code changes.
+@@ -29,14 +28,12 @@
+     pub system: (&'static str, &'static str),
+     pub user: (&'static str, &'static str),
+     pub assistant: &'static str,
+-    pub image: &'static str,
+ }
+ 
+ pub const QWEN35: Template = Template {
+     system: ("<|im_start|>system\n", "<|im_end|>\n"),
+     user: ("<|im_start|>user\n", "<|im_end|>\n"),
+     assistant: "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+-    image: "<|vision_start|><|image_pad|><|vision_end|>",
+ };
+ 
+ /// Prompt-lookup speculation: draft the source tokens that followed an occurrence of the output's last n words
+@@ -82,6 +79,7 @@
  /// Drafts for the output so far (`seq`, which ends with the output): the source tokens that followed an
  /// occurrence of the last n word keys of `seq` (n = ngram_max down to ngram_min). Takes the first occurrence
  /// that ends at or after `cursor` (where the previous draft's accepted part ended), else the first one.
@@ -16,7 +50,7 @@
  /// Returns the draft and the source position it starts at.
  fn lookup(src: &Source, seq: &[u32], keys: &[u64], sp: &Spec, limit: usize, cursor: usize) -> (Vec<u32>, usize) {
      let k = sp.draft_max.min(limit).min(model::VMAX - 1);
-@@ -100,15 +102,18 @@
+@@ -100,15 +98,18 @@
      }
      pat.reverse();
      let w = &src.words;
@@ -36,7 +70,7 @@
                  }
                  if j >= cursor {
                      break;
-@@ -118,8 +123,12 @@
+@@ -118,8 +119,12 @@
          if let Some(j) = hit {
              return (src.ids[j..(j + k).min(src.ids.len())].to_vec(), j);
          }
@@ -50,17 +84,175 @@
  }
  
  /// How far behind the cursor a lookup match may start (self-corrections repeat a few words).
-@@ -343,6 +352,9 @@
+@@ -247,7 +252,6 @@
+     pub prompt_tokens: usize,
+     pub cached_tokens: usize,
+     pub gen_tokens: usize,
+-    pub vision_s: f64,
+     pub prefill_s: f64,
+     pub ttft_s: f64,
+     pub decode_s: f64,
+@@ -264,7 +268,6 @@
+     pub text: Text,
+     pub tok: Tokenizer,
+     pub template: Template,
+-    vision: Option<vision::Vision>,
+     /// Cached prefix states, most recently used first.
+     prefixes: Vec<Prefix>,
+     /// Identity of the installed adapter (`adapter_id`), 0 without one.
+@@ -310,7 +313,6 @@
+             text,
+             tok,
+             template: QWEN35,
+-            vision: None,
+             prefixes: Vec::new(),
+             adapter: 0,
+             prefix_dir: None,
+@@ -335,14 +337,15 @@
+         Ok(())
+     }
+ 
+-    /// Runs `ids` (with optional spliced embeddings) through the model; returns argmax after the last row.
+-    /// `rows` are host embeddings for some rows: (row index, hidden-size floats).
+-    pub fn prefill(&mut self, ids: &[u32], pos: &[[i32; 3]], rows: &[(usize, &[f32])]) -> u32 {
++    /// Runs `ids` through the model; returns argmax after the last row.
++    pub fn prefill(&mut self, ids: &[u32], pos: &[[i32; 3]]) -> u32 {
+         self.flush_accept();
+         let mut next = 0;
          let mut i = 0;
-         let d = self.text.cfg.hidden;
-         while i < ids.len() {
+-        let d = self.text.cfg.hidden;
+-        while i < ids.len() {
++        while i < ids.len() {
 +            if ext::cancelled() {
 +                return EOS[0];
 +            }
              // a remainder of up to 16 rows joins the chunk before it, keeping the matmuls on their T > 16 kernel
              let left = ids.len() - i;
              let t = if left <= gpu::PREFILL_ROWS + 16 { left } else { gpu::PREFILL_ROWS }.min(TMAX);
-@@ -801,6 +813,9 @@
+@@ -351,21 +354,6 @@
+             let wb = &self.w.buf;
+             let mut cmd = self.gpu.begin();
+             self.text.encode_embed(&mut cmd, wb, t);
+-            let spliced: Vec<_> = rows.iter().filter(|(r, _)| *r >= i && *r < i + t).collect();
+-            if !spliced.is_empty() {
+-                cmd.finish();
+-                let h = self.text.hidden_ptr();
+-                for (r, v) in spliced {
+-                    unsafe {
+-                        std::ptr::copy_nonoverlapping(
+-                            v.as_ptr(),
+-                            h.add((r - i) * d),
+-                            d,
+-                        )
+-                    };
+-                }
+-                cmd = self.gpu.begin();
+-            }
+             self.text.encode_layers(&mut cmd, wb, t, false);
+             let last = i + t == ids.len();
+             if last {
+@@ -469,7 +457,7 @@
+             return prefix.len();
+         }
+         self.reset();
+-        self.prefill(prefix, &Self::text_positions(0, prefix.len()), &[]);
++        self.prefill(prefix, &Self::text_positions(0, prefix.len()));
+         let mut snap = self.new_snapshot(self.text.state.len);
+         snap.len = self.text.state.len;
+         snap.pos = self.text.state.pos;
+@@ -593,85 +581,39 @@
+         self.prefixes.clear();
+     }
+ 
+-    /// System prompt + user input (+ image) -> greedy output, streamed through `emit`.
++    /// System prompt + user input -> greedy output, streamed through `emit`.
+     pub fn generate(
+         &mut self,
+         system: Option<&str>,
+         user: &str,
+-        image: Option<&Path>,
+         max_tokens: usize,
+         emit: impl FnMut(&str),
+     ) -> Result<(Vec<u32>, Stats), String> {
+         let t0 = Instant::now();
+         let mut st = Stats::default();
+-        // Vision first: it does not depend on the text state.
+-        let img = match image {
+-            Some(p) => {
+-                if self.vision.is_none() {
+-                    self.vision = Some(vision::Vision::new(&self.gpu, &self.w));
+-                }
+-                let v = self.vision.as_ref().unwrap();
+-                let out = v.run(&self.gpu, &self.w.buf, p)?;
+-                st.vision_s = t0.elapsed().as_secs_f64();
+-                Some(out)
+-            }
+-            None => None,
+-        };
+         st.cached_tokens = self.start(system);
+         let t = &self.template;
+         let mut text = String::from(t.user.0);
+-        if img.is_some() {
+-            text.push_str(t.image);
+-        }
+         text.push_str(user.trim());
+         text.push_str(t.user.1);
+         text.push_str(t.assistant);
+         let raw = self.tok.encode(&text);
+-        self.generate_after_prefix(raw, img.as_ref(), max_tokens, t0, st, emit)
++        self.generate_after_prefix(raw, max_tokens, t0, st, emit)
+     }
+ 
+-    /// Prefills `raw` (user turn token ids, image pads expanded from `img`) on top of the current state
+-    /// and decodes greedily.
++    /// Prefills `raw` (user turn token ids) on top of the current state and decodes greedily.
+     pub fn generate_after_prefix(
+         &mut self,
+         raw: Vec<u32>,
+-        img: Option<&vision::ImageOut>,
+         max_tokens: usize,
+         t0: Instant,
+         mut st: Stats,
+         mut emit: impl FnMut(&str),
+     ) -> Result<(Vec<u32>, Stats), String> {
+-        let p0 = self.text.state.pos;
+-        let mut ids = Vec::with_capacity(raw.len());
+-        let mut pos = Vec::with_capacity(raw.len());
+-        let mut rows: Vec<(usize, &[f32])> = Vec::new();
+-        let mut p = p0;
+-        let d = self.text.cfg.hidden;
+-        for &id in &raw {
+-            if id == IMAGE_PAD {
+-                if let Some(im) = img {
+-                    let (gh, gw) = (im.grid.1 / 2, im.grid.2 / 2);
+-                    for r in 0..gh {
+-                        for c in 0..gw {
+-                            rows.push((
+-                                ids.len(),
+-                                &im.embeds[(r * gw + c) * d..][..d],
+-                            ));
+-                            ids.push(IMAGE_PAD);
+-                            pos.push([p, p + r as i32, p + c as i32]);
+-                        }
+-                    }
+-                    p += gh.max(gw) as i32;
+-                    continue;
+-                }
+-            }
+-            ids.push(id);
+-            pos.push([p; 3]);
+-            p += 1;
+-        }
+-        st.prompt_tokens = ids.len();
++        let pos = Self::text_positions(self.text.state.pos, raw.len());
++        st.prompt_tokens = raw.len();
+         let tp = Instant::now();
+-        let next = self.prefill(&ids, &pos, &rows);
++        let next = self.prefill(&raw, &pos);
+         st.prefill_s = tp.elapsed().as_secs_f64();
+         st.ttft_s = t0.elapsed().as_secs_f64();
+         let td = Instant::now();
+@@ -801,6 +743,9 @@
          // realized tokens and table cost of recent verify rounds (decayed like the policy's counts)
          let (mut got, mut spent, mut rounds) = (0.0, 0.0, 0);
          while out.len() < max_tokens {
@@ -70,7 +262,7 @@
              let last = *seq.last().unwrap();
              let left = max_tokens - out.len();
              if rounds >= GIVE_UP_ROUNDS && got < KEEP_GAIN * spent {
-@@ -913,6 +928,10 @@
+@@ -913,6 +858,10 @@
          self.text.encode_step(&mut cmd, &self.w.buf, k);
          let mut prev = cmd.commit();
          while out.len() < max_tokens {
@@ -81,6 +273,63 @@
              k += 1;
              let cur = if out.len() + 1 < max_tokens {
                  let mut cmd = self.gpu.begin();
+--- a/src/bonsai/runtime/gpu.rs
++++ b/src/bonsai/runtime/gpu.rs
+@@ -33,7 +33,7 @@
+ const KERNELS: &[&str] = &[
+     "norm_rotate", "swiglu_rotate", "gate_rotate", "gated_norm_rotate", "embed", "qmv4", "qmv3", "qmvr", "qmvxm",
+     "qmm", "gdn_ab", "gdn_conv", "conv_state", "gdn_recurrent", "attn_prep", "attn_split", "attn_combine", "argmax1",
+-    "argmax2", "v_gemm", "v_layernorm", "v_rope", "v_flash",
++    "argmax2",
+ ];
+ 
+ impl Gpu {
+--- a/src/bonsai/runtime/model.rs
++++ b/src/bonsai/runtime/model.rs
+@@ -34,7 +34,6 @@
+     pub rotary_dims: usize,
+     pub mrope: Vec<usize>,
+     pub eps: f64,
+-    pub vision_out: usize,
+ }
+ 
+ impl Config {
+@@ -62,7 +61,6 @@
+             rotary_dims: (head_dim as f64 * r["partial_rotary_factor"].as_f64().ok_or("config: partial_rotary_factor")?) as usize,
+             mrope: r["mrope_section"].as_array().ok_or("config: mrope_section")?.iter().map(|v| v.as_u64().unwrap() as usize).collect(),
+             eps: t["rms_norm_eps"].as_f64().ok_or("config: rms_norm_eps")?,
+-            vision_out: u(&j["vision_config"], "out_hidden_size")?,
+         })
+     }
+ 
+@@ -94,7 +92,6 @@
+             ("linear_value_head_dim", self.lin_v_dim, 128),
+             ("linear_conv_kernel_dim", self.conv_kernel, 4),
+             ("q heads per kv head", self.heads / self.kv_heads.max(1), 4),
+-            ("vision out_hidden_size", self.vision_out, self.hidden),
+         ];
+         for (k, got, w) in fixed {
+             if got != w {
+@@ -181,7 +178,7 @@
+     pub cap: usize,
+     /// Tokens in the KV cache.
+     pub len: usize,
+-    /// Next mrope position (differs from len after an image).
++    /// Next mrope position.
+     pub pos: i32,
+ }
+ 
+@@ -408,10 +405,6 @@
+         gpu::zero(&self.state.conv, self.n_gdn * self.cfg.conv_state() * 4);
+     }
+ 
+-    /// Host access to the hidden input rows (for splicing image embeddings).
+-    pub fn hidden_ptr(&self) -> *mut f32 {
+-        contents::<f32>(&self.s.h)
+-    }
+     pub fn hidden(&self) -> &Buffer {
+         &self.s.h
+     }
 --- a/src/bonsai/runtime/tokenizer.rs
 +++ b/src/bonsai/runtime/tokenizer.rs
 @@ -38,8 +38,8 @@
@@ -131,3 +380,170 @@
          let mut i = 0;
          while i < text.len() {
              let m = self.split.find_at(text, i).unwrap();
+--- a/src/bonsai/runtime/kernels.metal
++++ b/src/bonsai/runtime/kernels.metal
+@@ -839,164 +839,4 @@
+         if (v > bv || (v == bv && ix < bi)) { bv = v; bi = ix; }
+     }
+     out[row] = bi;
+-}
+-
+-// ---------------- Vision tower (fp16 activations and weights, fp32 accumulation, like mlx-vlm in fp16) --------
+-
+-inline float gelu_tanh(float x) { return 0.5f * x * (1.0f + precise::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x))); }
+-// erf via Numerical Recipes erfc Chebyshev fit (relative error < 1.2e-7).
+-inline float erf_(float x) {
+-    float z = fabs(x), t = 1.0f / (1.0f + 0.5f * z);
+-    float r = t * exp(-z * z - 1.26551223f + t * (1.00002368f + t * (0.37409196f + t * (0.09678418f + t * (-0.18628806f +
+-              t * (0.27886807f + t * (-1.13520398f + t * (1.48851587f + t * (-0.82215223f + t * 0.17087277f)))))))));
+-    return x >= 0 ? 1.0f - r : r - 1.0f;
+-}
+-inline float gelu_erf(float x) { return 0.5f * x * (1.0f + erf_(x * 0.7071067811865476f)); }
+-
+-// Y[M, N] = act(X[M, K] W[N, K]^T + bias) (+ R). Half in/out. Tile 32 x 64, K step 32, 4 simdgroups.
+-// act: 0 none, 1 gelu tanh, 2 gelu erf. Rounds to half after bias, after act and after the residual add.
+-kernel void v_gemm(device const half* X [[buffer(0)]], device const half* W [[buffer(1)]],
+-                   device const half* bias [[buffer(2)]], device half* Y [[buffer(3)]],
+-                   constant uint& M [[buffer(4)]], constant uint& N [[buffer(5)]], constant uint& K [[buffer(6)]],
+-                   constant uint& act [[buffer(7)]], constant uint& add [[buffer(8)]],
+-                   uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+-                   uint sid [[simdgroup_index_in_threadgroup]]) {
+-    threadgroup half xs[32 * 32];
+-    threadgroup half ws[64 * 32];
+-    threadgroup float out[32 * 64];
+-    uint n0 = tg.x * 64, m0 = tg.y * 32;
+-    simdgroup_float8x8 c[4][2];
+-    for (int i = 0; i < 4; i++) for (int j = 0; j < 2; j++) c[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+-    uint xr = tid / 4, xc = (tid % 4) * 8;
+-    uint wr = tid / 2, wc = (tid % 2) * 16;
+-    for (uint k0 = 0; k0 < K; k0 += 32) {
+-        threadgroup_barrier(mem_flags::mem_threadgroup);
+-        uint mm = m0 + xr;
+-        half4 a = 0, b = 0;
+-        if (mm < M) { a = *(device const half4*)(X + mm * K + k0 + xc); b = *(device const half4*)(X + mm * K + k0 + xc + 4); }
+-        *(threadgroup half4*)(xs + xr * 32 + xc) = a;
+-        *(threadgroup half4*)(xs + xr * 32 + xc + 4) = b;
+-        device const half* wp = W + (n0 + wr) * K + k0 + wc;
+-        for (uint j = 0; j < 16; j += 4) *(threadgroup half4*)(ws + wr * 32 + wc + j) = *(device const half4*)(wp + j);
+-        threadgroup_barrier(mem_flags::mem_threadgroup);
+-        for (uint kk = 0; kk < 32; kk += 8) {
+-            simdgroup_half8x8 am[4], bm[2];
+-            for (int i = 0; i < 4; i++) simdgroup_load(am[i], xs + i * 8 * 32 + kk, 32);
+-            for (int j = 0; j < 2; j++) simdgroup_load(bm[j], ws + (sid * 16 + j * 8) * 32 + kk, 32, ulong2(0, 0), true);
+-            for (int i = 0; i < 4; i++) for (int j = 0; j < 2; j++) simdgroup_multiply_accumulate(c[i][j], am[i], bm[j], c[i][j]);
+-        }
+-    }
+-    for (int i = 0; i < 4; i++) for (int j = 0; j < 2; j++) simdgroup_store(c[i][j], out + i * 8 * 64 + sid * 16 + j * 8, 64);
+-    threadgroup_barrier(mem_flags::mem_threadgroup);
+-    for (uint e = tid; e < 32 * 64; e += 128) {
+-        uint mm = m0 + e / 64, n = n0 + e % 64;
+-        if (mm < M) {
+-            float v = float(half(out[e] + float(bias[n])));
+-            if (act == 1) v = float(half(gelu_tanh(v)));
+-            else if (act == 2) v = float(half(gelu_erf(v)));
+-            uint o = mm * N + n;
+-            if (add) v = float(Y[o]) + v;
+-            Y[o] = half(v);
+-        }
+-    }
+-}
+-
+-// LayerNorm over D (fp32 statistics), eps 1e-6, half in/out. One threadgroup (256) per row.
+-kernel void v_layernorm(device const half* x [[buffer(0)]], device const half* w [[buffer(1)]],
+-                        device const half* b [[buffer(2)]], device half* y [[buffer(3)]], constant uint& D [[buffer(4)]],
+-                        uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+-                        uint sid [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+-    threadgroup float red[32];
+-    device const half* xr = x + row * D;
+-    float s = 0;
+-    for (uint i = tid; i < D; i += 256) s += float(xr[i]);
+-    float mean = tg_sum(s, red, sid, lane, 8) / float(D);
+-    float v = 0;
+-    for (uint i = tid; i < D; i += 256) { float d = float(xr[i]) - mean; v += d * d; }
+-    float r = rsqrt(tg_sum(v, red, sid, lane, 8) / float(D) + 1e-6f);
+-    for (uint i = tid; i < D; i += 256) y[row * D + i] = half((float(xr[i]) - mean) * r * float(w[i]) + float(b[i]));
+-}
+-
+-// qkv [N, 3, 16, 64] -> q, k (rotary applied), v as [16][N][64]. cs: per patch 32 angles (16 row, 16 col).
+-// grid (N, 3 * 16), 64 threads.
+-kernel void v_rope(device const half* qkv [[buffer(0)]], device const float* ang [[buffer(1)]],
+-                   device half* q [[buffer(2)]], device half* k [[buffer(3)]], device half* v [[buffer(4)]],
+-                   constant uint& N [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]], uint d [[thread_index_in_threadgroup]]) {
+-    uint p = tg.x, which = tg.y / 16, hd = tg.y % 16;
+-    device const half* src = qkv + p * 3072 + which * 1024 + hd * 64;
+-    uint o = (hd * N + p) * 64 + d;
+-    if (which == 2) { v[o] = src[d]; return; }
+-    float a = ang[p * 32 + (d & 31)];
+-    float x = float(src[d]);
+-    float rot = d < 32 ? -float(src[d + 32]) : float(src[d - 32]);
+-    float r = x * precise::cos(a) + rot * precise::sin(a);
+-    (which == 0 ? q : k)[o] = half(r);
+ }
+-
+-// Flash attention for the vision tower on simdgroup MMA. Each simdgroup owns 8 queries of one head and walks the
+-// keys in blocks of 8 with an online softmax; P is rounded to half for P V like MLX's fp16 attention.
+-// q, k, v: [16][N][64] half. Grid (ceil(N / 32), 16), 128 threads (4 simdgroups x 8 queries).
+-kernel void v_flash(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]], device const half* v [[buffer(2)]],
+-                    device half* out [[buffer(3)]], constant uint& N [[buffer(4)]],
+-                    uint2 tg [[threadgroup_position_in_grid]], uint sid [[simdgroup_index_in_threadgroup]],
+-                    uint lane [[thread_index_in_simdgroup]]) {
+-    uint hd = tg.y;
+-    uint q0 = (tg.x * 4 + sid) * 8;
+-    if (q0 >= N) return;
+-    uint qid = lane / 4;
+-    uint fm = (qid & 4) + ((lane / 2) % 4);
+-    uint fn = (qid & 2) * 2 + (lane % 2) * 2;
+-    device const half* qh = q + hd * N * 64;
+-    device const half* kh = k + hd * N * 64;
+-    device const half* vh = v + hd * N * 64;
+-    // Q fragments (8 queries x 64 dims); rows past N are clamped to N - 1 and never stored.
+-    simdgroup_half8x8 qf[8];
+-    uint qrow = min(q0 + fm, N - 1);
+-    for (uint f = 0; f < 8; f++) {
+-        qf[f].thread_elements()[0] = qh[qrow * 64 + f * 8 + fn];
+-        qf[f].thread_elements()[1] = qh[qrow * 64 + f * 8 + fn + 1];
+-    }
+-    simdgroup_float8x8 o[8];
+-    for (uint f = 0; f < 8; f++) o[f] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+-    float m = -INFINITY, l = 0;
+-    for (uint j0 = 0; j0 < N; j0 += 8) {
+-        simdgroup_float8x8 sfr = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+-        for (uint f = 0; f < 8; f++) {
+-            simdgroup_half8x8 kt;
+-            simdgroup_load(kt, kh + j0 * 64 + f * 8, 64, ulong2(0, 0), true);
+-            simdgroup_multiply_accumulate(sfr, qf[f], kt, sfr);
+-        }
+-        float s0 = sfr.thread_elements()[0] * 0.125f, s1 = sfr.thread_elements()[1] * 0.125f;
+-        if (j0 + fn >= N) s0 = -INFINITY;
+-        if (j0 + fn + 1 >= N) s1 = -INFINITY;
+-        float mx = max(s0, s1);
+-        mx = max(mx, simd_shuffle_xor(mx, 1));
+-        mx = max(mx, simd_shuffle_xor(mx, 8));
+-        float mn = max(m, mx);
+-        float c = exp(m - mn);
+-        float p0 = exp(s0 - mn), p1 = exp(s1 - mn);
+-        float ps = p0 + p1;
+-        ps += simd_shuffle_xor(ps, 1);
+-        ps += simd_shuffle_xor(ps, 8);
+-        l = l * c + ps;
+-        m = mn;
+-        simdgroup_half8x8 pf;
+-        pf.thread_elements()[0] = half(p0);
+-        pf.thread_elements()[1] = half(p1);
+-        for (uint f = 0; f < 8; f++) {
+-            o[f].thread_elements()[0] *= c;
+-            o[f].thread_elements()[1] *= c;
+-            simdgroup_half8x8 vf;
+-            simdgroup_load(vf, vh + j0 * 64 + f * 8, 64);
+-            simdgroup_multiply_accumulate(o[f], pf, vf, o[f]);
+-        }
+-    }
+-    uint row = q0 + fm;
+-    if (row < N) {
+-        for (uint f = 0; f < 8; f++) {
+-            out[row * 1024 + hd * 64 + f * 8 + fn] = half(o[f].thread_elements()[0] / l);
+-            out[row * 1024 + hd * 64 + f * 8 + fn + 1] = half(o[f].thread_elements()[1] / l);
+-        }
+-    }
+-}
+-
