@@ -20,7 +20,7 @@ On a platform a model does not support, its module still builds and reports itse
 
 ```toml
 [dependencies]
-glimpse-language = { git = "https://github.com/glimpse-hq/Glimpse-Language.git", tag = "0.3.0", features = ["apple", "bonsai"] }
+glimpse-language = { git = "https://github.com/glimpse-hq/Glimpse-Language.git", tag = "0.4.0", features = ["apple", "bonsai"] }
 ```
 
 ### Apple
