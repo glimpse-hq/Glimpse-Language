@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `bonsai`: `Bonsai::prewarm` takes `save_prompt`, and `GenerateOptions` has `save_prompt` (on by default). Off keeps the prompt's state in memory only, for prompts that hold per-request text such as a window title or URL.
+
+### Fixed
+
+- `bonsai`: loading deletes saved prompt states it can no longer use (from another build, model or adapter) instead of leaving them on disk.
+
 ## 0.3.0
 
 ### Changed
