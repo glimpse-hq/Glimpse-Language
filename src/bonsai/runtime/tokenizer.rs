@@ -38,8 +38,8 @@ fn byte_unicode() -> [char; 256] {
 }
 
 impl Tokenizer {
-    /// Loads `cache` if it was built from this tokenizer.json (size and mtime match), otherwise parses
-    /// the JSON and writes the cache (best effort).
+    /// Loads `cache` if it was built from this tokenizer.json (size and mtime match) and its checksum holds,
+    /// otherwise parses the JSON and writes the cache (best effort).
     pub fn load(json: &Path, cache: &Path) -> Result<Tokenizer, String> {
         let meta = std::fs::metadata(json).map_err(|e| format!("{}: {e}", json.display()))?;
         let stamp = meta.len()
@@ -137,7 +137,7 @@ impl Tokenizer {
     fn to_cache(&self, stamp: u64) -> Vec<u8> {
         let mut o = Vec::new();
         let u = |o: &mut Vec<u8>, v: u32| o.extend_from_slice(&v.to_le_bytes());
-        o.extend_from_slice(b"BTK1");
+        o.extend_from_slice(b"BTK2");
         o.extend_from_slice(&stamp.to_le_bytes());
         u(&mut o, self.offs.len() as u32);
         u(&mut o, self.blob.len() as u32);
@@ -160,12 +160,16 @@ impl Tokenizer {
             u(&mut o, s.len() as u32);
             o.extend_from_slice(s.as_bytes());
         }
+        let sum = super::hash_bytes(super::FNV, &o);
+        o.extend_from_slice(&sum.to_le_bytes());
         o
     }
 
     fn from_cache(b: &[u8], stamp: u64) -> Option<Tokenizer> {
+        let (b, sum) = b.split_at_checked(b.len().checked_sub(8)?)?;
         if b.len() < 28
-            || &b[..4] != b"BTK1"
+            || u64::from_le_bytes(sum.try_into().ok()?) != super::hash_bytes(super::FNV, b)
+            || &b[..4] != b"BTK2"
             || u64::from_le_bytes(b[4..12].try_into().ok()?) != stamp
         {
             return None;

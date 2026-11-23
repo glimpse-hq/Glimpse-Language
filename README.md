@@ -74,7 +74,7 @@ if availability() == Availability::Available {
 - `availability()`: Apple Silicon on macOS 14+, or a Vulkan 1.3 GPU on Windows (NVIDIA, AMD RDNA, Intel Arc or Xe). No CPU fallback.
 - `Bonsai::load(dir, adapter)`: loads the model and an optional LoRA adapter.
 - `prewarm(system_prompt)`: caches the system prompt so `generate` prefills only the user turn. The last three prompts are cached and saved to `prefix-cache/` for the next launch.
-- `generate(...)`: greedy decoding until end of turn or `max_tokens`. `cancel` stops decoding within one step.
+- `generate(...)`: greedy decoding until end of turn or `max_tokens`. `cancel` stops the user text's prefill at its next batch and decoding within one step.
 - `generate_streaming(..., on_text)`: `generate`, with `on_text` seeing the output as it is decoded. Returning `ControlFlow::Break` stops the run with `StopReason::Stopped`.
 - `count_tokens(text)`: the number of tokens `text` encodes to.
 - `device()`: the GPU and driver version Bonsai runs on, for redoing checks after a driver update.
