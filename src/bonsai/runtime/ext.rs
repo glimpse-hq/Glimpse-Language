@@ -4,7 +4,7 @@ use super::gpu::Gpu;
 use super::model::{Config, Text, VMAX};
 use super::tokenizer::Tokenizer;
 use super::weights::Weights;
-use super::{Model, Prefix, QWEN35, Spec, Stats, Template};
+use super::{Model, Prefix, QWEN35, Spec, Stats};
 use std::cell::Cell;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -41,15 +41,19 @@ fn with_cancel<R>(flag: Option<&AtomicBool>, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// The system turn, as `Model::generate` builds it.
-pub(crate) fn system_turn(t: &Template, system: &str) -> String {
-    format!("{}{}{}", t.system.0, system.trim(), t.system.1)
+/// A turn laid out as `Model::generate` builds it: `text` trimmed between the template's markers. Only the
+/// markers become control tokens; `<|im_end|>` typed inside `text` stays text.
+fn encode_turn(tok: &Tokenizer, open: &str, text: &str, close: &str) -> Vec<u32> {
+    let mut ids = tok.encode(open);
+    tok.encode_plain(text.trim(), &mut ids);
+    ids.extend(tok.encode(close));
+    ids
 }
 
-/// The user turn plus the assistant header with the empty think block, as `Model::generate` builds it
-/// for text input.
-pub(crate) fn user_turn(t: &Template, user: &str) -> String {
-    format!("{}{}{}{}", t.user.0, user.trim(), t.user.1, t.assistant)
+fn count_text(tok: &Tokenizer, text: &str) -> usize {
+    let mut ids = Vec::new();
+    tok.encode_plain(text, &mut ids);
+    ids.len()
 }
 
 /// What stays when idle: device and pipelines, mapped weights, tokenizer and its draft keys, cached prefix states.
@@ -120,7 +124,8 @@ impl Model {
         let ids = if system.trim().is_empty() {
             Vec::new()
         } else {
-            self.tok.encode(&system_turn(&self.template, system))
+            let (open, close) = self.template.system;
+            encode_turn(&self.tok, open, system, close)
         };
         let context = self.text.ctx;
         if ids.len() + VMAX + 1 > context {
@@ -138,7 +143,7 @@ impl Model {
     }
 
     pub(crate) fn count_tokens(&self, text: &str) -> usize {
-        self.tok.encode(text).len()
+        count_text(&self.tok, text)
     }
 
     /// One greedy request. The output cap shrinks to what the context has room for. `on_text` sees the
@@ -155,7 +160,8 @@ impl Model {
     ) -> Result<Run, RunError> {
         let t0 = Instant::now();
         let prefix = self.start_system(system)?;
-        let raw = self.tok.encode(&user_turn(&self.template, user));
+        let t = &self.template;
+        let raw = encode_turn(&self.tok, t.user.0, user, &format!("{}{}", t.user.1, t.assistant));
         let context = self.text.ctx;
         let used = prefix + raw.len();
         if used + VMAX + 1 > context {
@@ -199,7 +205,7 @@ impl Model {
 
 impl Idle {
     pub(crate) fn count_tokens(&self, text: &str) -> usize {
-        self.tok.encode(text).len()
+        count_text(&self.tok, text)
     }
 
     pub(crate) fn wake(self) -> Model {
@@ -226,31 +232,6 @@ impl Idle {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn system_turn_matches_qwen35() {
-        assert_eq!(
-            system_turn(&QWEN35, "  Clean up the text.\n"),
-            "<|im_start|>system\nClean up the text.<|im_end|>\n"
-        );
-    }
-
-    #[test]
-    fn user_turn_ends_with_empty_think_block() {
-        assert_eq!(
-            user_turn(&QWEN35, "um hello there "),
-            "<|im_start|>user\num hello there<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-        );
-    }
-
-    #[test]
-    fn full_prompt_matches_golden_layout() {
-        let prompt = format!("{}{}", system_turn(&QWEN35, "S"), user_turn(&QWEN35, "U"));
-        assert_eq!(
-            prompt,
-            "<|im_start|>system\nS<|im_end|>\n<|im_start|>user\nU<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-        );
-    }
 
     #[test]
     fn runtime_accepts_2b_and_4b_configs() {
