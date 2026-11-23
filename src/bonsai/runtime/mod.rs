@@ -352,6 +352,9 @@ impl Model {
         let mut i = 0;
         let d = self.text.cfg.hidden;
         while i < ids.len() {
+            if ext::cancelled() {
+                return EOS[0];
+            }
             // a remainder of up to 16 rows joins the chunk before it, keeping the matmuls on their T > 16 kernel
             let left = ids.len() - i;
             let t = if left <= gpu::PREFILL_ROWS + 16 { left } else { gpu::PREFILL_ROWS }.min(TMAX);
