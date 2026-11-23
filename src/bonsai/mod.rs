@@ -280,7 +280,8 @@ impl Bonsai {
     }
 
     /// One greedy request. An empty `system_prompt` means none. Blocking; call from a blocking-capable
-    /// thread. Setting `cancel` stops decoding within one step and returns `Cancelled`.
+    /// thread. Setting `cancel` stops the user text's prefill at its next batch and decoding within one step,
+    /// and returns `Cancelled`.
     pub fn generate(
         &self,
         system_prompt: &str,

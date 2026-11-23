@@ -83,6 +83,7 @@ fn token_key(bytes: &[u8]) -> u64 {
 /// Drafts for the output so far (`seq`, which ends with the output): the source tokens that followed an
 /// occurrence of the last n word keys of `seq` (n = ngram_max down to ngram_min). Takes the first occurrence
 /// that ends at or after `cursor` (where the previous draft's accepted part ended), else the first one.
+/// With no such match for any n, the nearest one further behind (a cursor that ran ahead in repeated text).
 /// Returns the draft and the source position it starts at.
 fn lookup(src: &Source, seq: &[u32], keys: &[u64], sp: &Spec, limit: usize, cursor: usize) -> (Vec<u32>, usize) {
     let k = sp.draft_max.min(limit).min(model::VMAX - 1);
@@ -101,15 +102,18 @@ fn lookup(src: &Source, seq: &[u32], keys: &[u64], sp: &Spec, limit: usize, curs
     }
     pat.reverse();
     let w = &src.words;
+    let mut far = None;
     for n in (sp.ngram_min..=sp.ngram_max.min(pat.len())).rev() {
         let p = &pat[pat.len() - n..];
-        let mut hit = None;
+        let (mut hit, mut behind) = (None, None);
         for i in 0..w.len().saturating_sub(n - 1) {
             if w[i..i + n].iter().zip(p).all(|(a, b)| a.0 == *b) {
                 let j = w[i + n - 1].1 + 1;
                 // the output moves forward through the source: a match far behind it is a different spot
                 if j < src.ids.len() && j + BACK >= cursor && (hit.is_none() || j >= cursor) {
                     hit = Some(j);
+                } else if j + BACK < cursor {
+                    behind = Some(j);
                 }
                 if j >= cursor {
                     break;
@@ -119,8 +123,12 @@ fn lookup(src: &Source, seq: &[u32], keys: &[u64], sp: &Spec, limit: usize, curs
         if let Some(j) = hit {
             return (src.ids[j..(j + k).min(src.ids.len())].to_vec(), j);
         }
+        far = far.or(behind);
     }
-    (Vec::new(), cursor)
+    match far {
+        Some(j) => (src.ids[j..(j + k).min(src.ids.len())].to_vec(), j),
+        None => (Vec::new(), cursor),
+    }
 }
 
 /// How far behind the cursor a lookup match may start (self-corrections repeat a few words).
@@ -344,6 +352,9 @@ impl Model {
         let mut i = 0;
         let d = self.text.cfg.hidden;
         while i < ids.len() {
+            if ext::cancelled() {
+                return EOS[0];
+            }
             // a remainder of up to 16 rows joins the chunk before it, keeping the matmuls on their T > 16 kernel
             let left = ids.len() - i;
             let t = if left <= gpu::PREFILL_ROWS + 16 { left } else { gpu::PREFILL_ROWS }.min(TMAX);
