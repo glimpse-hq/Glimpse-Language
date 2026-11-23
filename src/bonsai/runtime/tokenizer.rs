@@ -256,7 +256,8 @@ impl Tokenizer {
         out
     }
 
-    fn encode_plain(&self, text: &str, out: &mut Vec<u32>) {
+    /// `encode` without added tokens: every character is text.
+    pub fn encode_plain(&self, text: &str, out: &mut Vec<u32>) {
         let mut i = 0;
         while i < text.len() {
             let m = self.split.find_at(text, i).unwrap();

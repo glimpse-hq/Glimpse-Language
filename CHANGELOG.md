@@ -10,6 +10,7 @@
 ### Fixed
 
 - `bonsai`: loading deletes saved prompt states it can no longer use (from another build, model or adapter) instead of leaving them on disk.
+- `bonsai`: chat markers such as `<|im_end|>` inside the system prompt or user text are read as plain text, so the output no longer stops early or drops them. `count_tokens` counts them the same way.
 
 ## 0.3.0
 
