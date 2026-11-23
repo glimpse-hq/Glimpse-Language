@@ -22,7 +22,7 @@ fn main() {
         }
     };
     println!("model: {}", model.info().size.label());
-    model.prewarm(SYSTEM).expect("prewarm");
+    model.prewarm(SYSTEM, true).expect("prewarm");
 
     let raw = "um so i was thinking uh maybe we should we should move the the launch to thursday \
                because uh the build isnt ready and and jen said the uh the release notes arent done either";

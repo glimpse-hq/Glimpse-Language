@@ -101,6 +101,9 @@ pub struct GenerateOptions {
     /// it can differ where two logits nearly tie. It turns itself off within a request when drafts keep
     /// failing.
     pub speculate: bool,
+    /// Save the system prompt's state to disk for the next load. Turn it off for a prompt that holds
+    /// per-request text, like a window title or URL: the saved state contains the prompt's tokens.
+    pub save_prompt: bool,
 }
 
 impl Default for GenerateOptions {
@@ -109,6 +112,7 @@ impl Default for GenerateOptions {
             max_tokens: 1024,
             stop_at_eos: true,
             speculate: true,
+            save_prompt: true,
         }
     }
 }
@@ -260,16 +264,17 @@ impl Bonsai {
     }
 
     /// Prefills `system_prompt` and caches its state, so a `generate` with the same prompt only prefills
-    /// the user text. The three most recent prompts stay cached, also across `release_idle`, and are saved
-    /// in the model directory's `prefix-cache` folder for the next load. Blocking.
-    pub fn prewarm(&self, system_prompt: &str) -> Result<(), BonsaiError> {
+    /// the user text. The three most recent prompts stay cached, also across `release_idle`. With
+    /// `save_prompt`, a state built now is also saved in the model directory's `prefix-cache` folder for
+    /// the next load (see `GenerateOptions::save_prompt`). Blocking.
+    pub fn prewarm(&self, system_prompt: &str, save_prompt: bool) -> Result<(), BonsaiError> {
         #[cfg(bonsai_backend)]
         {
-            self.inner.prewarm(system_prompt)
+            self.inner.prewarm(system_prompt, save_prompt)
         }
         #[cfg(not(bonsai_backend))]
         {
-            let _ = system_prompt;
+            let _ = (system_prompt, save_prompt);
             match self.inner {}
         }
     }

@@ -122,8 +122,8 @@ impl Handle {
         })
     }
 
-    pub fn prewarm(&self, system: &str) -> Result<(), BonsaiError> {
-        self.with_model(|model| model.prewarm_system(system))
+    pub fn prewarm(&self, system: &str, save: bool) -> Result<(), BonsaiError> {
+        self.with_model(|model| model.prewarm_system(system, save))
     }
 
     pub fn count_tokens(&self, text: &str) -> Result<usize, BonsaiError> {
@@ -150,6 +150,7 @@ impl Handle {
                 options.max_tokens,
                 options.stop_at_eos,
                 options.speculate,
+                options.save_prompt,
                 cancel,
                 on_text,
             )
@@ -238,6 +239,7 @@ fn load_model(dir: &Path, adapter: Option<&Path>) -> Result<Model, BonsaiError> 
         if adapter.is_some() {
             model.set_lora(adapter, 1.0)?;
         }
+        model.remove_stale_prefixes();
         Ok(model)
     })
     .map_err(|message| BonsaiError::new(BonsaiErrorKind::Load, message))
