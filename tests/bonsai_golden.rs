@@ -112,6 +112,40 @@ fn matches_mlx_golden_outputs() {
         }
     }
 
+    // With save_prompt off a prompt stays off disk; a load deletes states this build cannot use and
+    // abandoned writes, and keeps its own.
+    let listing = || {
+        let mut names: Vec<_> = std::fs::read_dir(&saved)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let own = listing();
+    let private = "Refer to the open window \"Budget 2027 draft\" by name.";
+    model.prewarm(private, false).unwrap();
+    let options = GenerateOptions {
+        max_tokens: 8,
+        save_prompt: false,
+        ..Default::default()
+    };
+    model.generate(private, "hello", &options, None).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(listing(), own, "a save_prompt=false prompt was saved");
+    std::fs::write(saved.join("0000000000000000.prefix"), b"another build").unwrap();
+    let abandoned = saved.join("0000000000000000.tmp");
+    std::fs::File::create(&abandoned)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(600))
+        .unwrap();
+    let writing = saved.join("0000000000000001.tmp");
+    std::fs::write(&writing, b"in progress").unwrap();
+    drop(Bonsai::load(&dir, None).expect("load"));
+    std::fs::remove_file(&writing).expect("a fresh write was deleted");
+    assert_eq!(listing(), own, "stale files kept or own states deleted");
+
     let cancel = AtomicBool::new(true);
     let err = model
         .generate(system, user, &GenerateOptions::default(), Some(&cancel))

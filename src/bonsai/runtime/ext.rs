@@ -11,7 +11,7 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 thread_local! {
     static CANCEL: Cell<*const AtomicBool> = const { Cell::new(std::ptr::null()) };
@@ -145,7 +145,7 @@ impl Model {
     }
 
     /// Deletes saved prefix states this model cannot load (made by another executable, model, adapter or
-    /// format) and unfinished writes, so none outlive the build that wrote them.
+    /// format) and writes abandoned for a minute, so none outlive the build that wrote them.
     pub(crate) fn remove_stale_prefixes(&self) {
         let (Some(dir), Some(identity)) = (&self.prefix_dir, self.prefix_identity()) else {
             return;
@@ -155,7 +155,10 @@ impl Model {
         };
         for path in entries.flatten().map(|e| e.path()) {
             let stale = match path.extension().and_then(|x| x.to_str()) {
-                Some("tmp") => true,
+                // a save in progress (another handle on this directory) writes for well under a second
+                Some("tmp") => std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > Duration::from_secs(60))),
                 Some("prefix") => {
                     let mut head = vec![0; identity.len()];
                     !std::fs::File::open(&path)
