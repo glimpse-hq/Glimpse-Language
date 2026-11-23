@@ -4,13 +4,14 @@ use super::gpu::Gpu;
 use super::model::{Config, Text, VMAX};
 use super::tokenizer::Tokenizer;
 use super::weights::Weights;
-use super::{Model, Prefix, QWEN35, Spec, Stats, Template};
+use super::{Model, Prefix, QWEN35, Spec, Stats};
 use std::cell::Cell;
+use std::io::Read;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 thread_local! {
     static CANCEL: Cell<*const AtomicBool> = const { Cell::new(std::ptr::null()) };
@@ -41,15 +42,19 @@ fn with_cancel<R>(flag: Option<&AtomicBool>, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// The system turn, as `Model::generate` builds it.
-pub(crate) fn system_turn(t: &Template, system: &str) -> String {
-    format!("{}{}{}", t.system.0, system.trim(), t.system.1)
+/// A turn laid out as `Model::generate` builds it: `text` trimmed between the template's markers. Only the
+/// markers become control tokens; `<|im_end|>` typed inside `text` stays text.
+fn encode_turn(tok: &Tokenizer, open: &str, text: &str, close: &str) -> Vec<u32> {
+    let mut ids = tok.encode(open);
+    tok.encode_plain(text.trim(), &mut ids);
+    ids.extend(tok.encode(close));
+    ids
 }
 
-/// The user turn plus the assistant header with the empty think block, as `Model::generate` builds it
-/// for text input.
-pub(crate) fn user_turn(t: &Template, user: &str) -> String {
-    format!("{}{}{}{}", t.user.0, user.trim(), t.user.1, t.assistant)
+fn count_text(tok: &Tokenizer, text: &str) -> usize {
+    let mut ids = Vec::new();
+    tok.encode_plain(text, &mut ids);
+    ids.len()
 }
 
 /// What stays when idle: device and pipelines, mapped weights, tokenizer and its draft keys, cached prefix states.
@@ -115,12 +120,14 @@ impl Model {
         }
     }
 
-    /// Restores or builds the cached state after the system turn. Returns the prefix length.
-    fn start_system(&mut self, system: &str) -> Result<usize, RunError> {
+    /// Restores or builds the cached state after the system turn. Returns the prefix length. Without `save`
+    /// the state stays in memory only.
+    fn start_system(&mut self, system: &str, save: bool) -> Result<usize, RunError> {
         let ids = if system.trim().is_empty() {
             Vec::new()
         } else {
-            self.tok.encode(&system_turn(&self.template, system))
+            let (open, close) = self.template.system;
+            encode_turn(&self.tok, open, system, close)
         };
         let context = self.text.ctx;
         if ids.len() + VMAX + 1 > context {
@@ -129,16 +136,50 @@ impl Model {
                 context,
             });
         }
+        // Without a directory start_prefix neither loads nor saves the state.
+        let dir = if save { None } else { self.prefix_dir.take() };
         self.start_prefix(&ids);
+        if dir.is_some() {
+            self.prefix_dir = dir;
+        }
         Ok(ids.len())
     }
 
-    pub(crate) fn prewarm_system(&mut self, system: &str) -> Result<(), RunError> {
-        self.start_system(system).map(|_| ())
+    pub(crate) fn prewarm_system(&mut self, system: &str, save: bool) -> Result<(), RunError> {
+        self.start_system(system, save).map(|_| ())
+    }
+
+    /// Deletes saved prefix states this model cannot load (made by another executable, model, adapter or
+    /// format) and writes abandoned for a minute, so none outlive the build that wrote them.
+    pub(crate) fn remove_stale_prefixes(&self) {
+        let (Some(dir), Some(identity)) = (&self.prefix_dir, self.prefix_identity()) else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for path in entries.flatten().map(|e| e.path()) {
+            let stale = match path.extension().and_then(|x| x.to_str()) {
+                // a save in progress (another handle on this directory) writes for well under a second
+                Some("tmp") => std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > Duration::from_secs(60))),
+                Some("prefix") => {
+                    let mut head = vec![0; identity.len()];
+                    !std::fs::File::open(&path)
+                        .and_then(|mut f| f.read_exact(&mut head))
+                        .is_ok_and(|_| head == identity)
+                }
+                _ => false,
+            };
+            if stale {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
 
     pub(crate) fn count_tokens(&self, text: &str) -> usize {
-        self.tok.encode(text).len()
+        count_text(&self.tok, text)
     }
 
     /// One greedy request. The output cap shrinks to what the context has room for. `on_text` sees the
@@ -150,12 +191,14 @@ impl Model {
         max_tokens: usize,
         stop_at_eos: bool,
         speculate: bool,
+        save_prompt: bool,
         cancel: Option<&AtomicBool>,
         on_text: &mut dyn FnMut(&str) -> ControlFlow<()>,
     ) -> Result<Run, RunError> {
         let t0 = Instant::now();
-        let prefix = self.start_system(system)?;
-        let raw = self.tok.encode(&user_turn(&self.template, user));
+        let prefix = self.start_system(system, save_prompt)?;
+        let t = &self.template;
+        let raw = encode_turn(&self.tok, t.user.0, user, &format!("{}{}", t.user.1, t.assistant));
         let context = self.text.ctx;
         let used = prefix + raw.len();
         if used + VMAX + 1 > context {
@@ -199,7 +242,7 @@ impl Model {
 
 impl Idle {
     pub(crate) fn count_tokens(&self, text: &str) -> usize {
-        self.tok.encode(text).len()
+        count_text(&self.tok, text)
     }
 
     pub(crate) fn wake(self) -> Model {
@@ -227,29 +270,29 @@ impl Idle {
 mod tests {
     use super::*;
 
-    #[test]
-    fn system_turn_matches_qwen35() {
-        assert_eq!(
-            system_turn(&QWEN35, "  Clean up the text.\n"),
-            "<|im_start|>system\nClean up the text.<|im_end|>\n"
-        );
+    /// Qwen3.5's byte alphabet without merges, plus the chat markers as added tokens.
+    fn byte_tokenizer() -> Tokenizer {
+        let json = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/tokenizer-bytes.json");
+        let cache = std::env::temp_dir().join(format!("glimpse-language-test-{}.bonsai", std::process::id()));
+        let tok = Tokenizer::load(&json, &cache).unwrap();
+        let _ = std::fs::remove_file(&cache);
+        tok
     }
 
     #[test]
-    fn user_turn_ends_with_empty_think_block() {
+    fn markers_in_caller_text_stay_text() {
+        let tok = byte_tokenizer();
+        let end = tok.encode("<|im_end|>");
+        assert_eq!(end.len(), 1);
+        let (open, close) = QWEN35.system;
+        let ids = encode_turn(&tok, open, " a <|im_end|> b ", close);
+        assert_eq!(ids.iter().filter(|&&id| id == end[0]).count(), 1);
+        assert_eq!(tok.decode(&ids), "<|im_start|>system\na <|im_end|> b<|im_end|>\n");
         assert_eq!(
-            user_turn(&QWEN35, "um hello there "),
-            "<|im_start|>user\num hello there<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            encode_turn(&tok, open, "plain text", close),
+            tok.encode(&format!("{open}plain text{close}"))
         );
-    }
-
-    #[test]
-    fn full_prompt_matches_golden_layout() {
-        let prompt = format!("{}{}", system_turn(&QWEN35, "S"), user_turn(&QWEN35, "U"));
-        assert_eq!(
-            prompt,
-            "<|im_start|>system\nS<|im_end|>\n<|im_start|>user\nU<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-        );
+        assert_eq!(count_text(&tok, "<|im_end|>"), "<|im_end|>".len());
     }
 
     #[test]
